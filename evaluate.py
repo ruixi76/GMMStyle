@@ -14,6 +14,8 @@ from datasets import get_dataloaders
 from model import DomainAdapter
 from pixel_gmm import PixelGaussianMixture
 from style_transfer import PixelStyleTransfer
+# 引入 transform
+from torchvision import transforms
 
 def load_checkpoint(checkpoint_path, config, device):
     """加载训练好的模型和GMM参数"""
@@ -78,6 +80,12 @@ def evaluate(model, gmm, target_stats, dataloader, device, config, save_dir='./e
         num_components=config.num_gaussians,
         eps=1e-6
     ).to(device)
+
+    # 添加标准化层
+    normalize = transforms.Normalize(
+        mean=[0.485, 0.456, 0.406], 
+        std=[0.229, 0.224, 0.225]
+    ).to(device)
     
     with torch.no_grad():
         for batch_idx, (images, labels, _, _) in enumerate(tqdm(dataloader, desc='Evaluating')):
@@ -112,6 +120,8 @@ def evaluate(model, gmm, target_stats, dataloader, device, config, save_dir='./e
             else:
                 inputs = images
             
+            # 【修复1】加上标准化
+            inputs = normalize(inputs)
             # 3. 预测
             outputs, _ = model(inputs)
             _, preds = torch.max(outputs, 1)
