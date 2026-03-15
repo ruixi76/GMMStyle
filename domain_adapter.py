@@ -263,6 +263,62 @@ class GMMStyleDomainAdapter:
 
         return total_loss / len(source_loader), 0.0 # 返回 acc
     
+    # 以下是你在跑 MixStyle baseline 时，替代原先 train_epoch 的逻辑片段
+
+    def train_epoch_mixstyle(self, source_loader, target_loader, epoch):
+        self.model.train()
+        target_iter = iter(target_loader)
+        
+        # 训练进度
+        pbar = tqdm(enumerate(source_loader), total=len(source_loader), desc=f'Epoch {epoch+1}')
+
+        for batch_idx, (source_images, labels, _, _) in enumerate(source_loader):
+            source_images = source_images.to(self.device)
+            labels = labels.to(self.device)
+            
+            try:
+                target_images, _, _, _ = next(target_iter)
+            except StopIteration:
+                target_iter = iter(target_loader)
+                target_images, _, _, _ = next(target_iter)
+            target_images = target_images.to(self.device)
+
+            # 加上 ImageNet 标准化 (因为没有你的像素级操作，直接正常输入即可)
+            source_images = self.normalize(source_images)
+            target_images = self.normalize(target_images)
+
+            # 核心：将 Source 和 Target 拼接在一起，送入含有 MixStyle 的网络
+            # 这样网络内部的 MixStyle 就能把 Source 和 Target 的底层特征统计量进行混合
+            combined_images = torch.cat([source_images, target_images], dim=0)
+            
+            self.optimizer.zero_grad()
+            
+            # 前向传播 (此时 MixStyle 会在特征层自动发生)
+            logits_combined, _ = self.model(combined_images)
+            
+            # 拆分预测结果
+            batch_src = source_images.size(0)
+            logits_src = logits_combined[:batch_src]
+            logits_tgt = logits_combined[batch_src:]
+            
+            # 1. 源域分类损失
+            loss_src = self.criterion(logits_src, labels)
+            
+            # 2. 目标域伪标签损失 (为了与你的方法公平对比，保留你的伪标签学习策略)
+            probs_tgt = torch.softmax(logits_tgt, dim=1)
+            max_probs, tgt_preds = torch.max(probs_tgt, dim=1)
+            mask = max_probs.ge(self.conf_threshold).float()
+            loss_tgt = (nn.CrossEntropyLoss(reduction='none')(logits_tgt, tgt_preds) * mask).mean()
+            
+            # 只需要这两个损失即可，没有 loss_style 了
+            loss = loss_src + self.lambda_target * loss_tgt
+            
+            loss.backward()
+            self.optimizer.step()
+
+            # 7. 更新进度条
+
+    
     def validate(self, loader, domain_name='target'):
         """
         在指定域上验证模型
