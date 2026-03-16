@@ -5,12 +5,19 @@ class Config:
     def __init__(self):
         self.parser = argparse.ArgumentParser(description='Pixel-level GMM Domain Adaptation')
         
+        self.dataset = 'pacs' # 新增数据集标识
+        self.num_classes = 7  # PACS 有 7 个类别 (Dog, Elephant, Giraffe, Guitar, Horse, House, Person)
+        
+        # 将 source_domain 改为列表
+        self.source_domains = ['art_painting', 'cartoon', 'sketch'] 
+        self.target_domain = 'photo'
+
         # 数据集配置
         self.parser.add_argument('--source_domain', type=str, default='amazon', 
                                help='Source domain name (e.g., amazon)')
         self.parser.add_argument('--target_domain', type=str, default='dslr', 
                                help='Target domain name (e.g., dslr)')
-        self.parser.add_argument('--data_root', type=str, default='./data', 
+        self.parser.add_argument('--data_root', type=str, default='/home/amax/paperProject/GMM/data', 
                                help='Root directory of datasets')
         self.parser.add_argument('--dataset', type=str, default='office31', 
                                choices=['office31', 'visda', 'digits', 'pacs'],

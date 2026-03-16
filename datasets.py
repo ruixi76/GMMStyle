@@ -51,7 +51,7 @@ class DomainDataset(Dataset):
         
         return image, label, class_name, img_path
 
-def get_dataloaders(config):
+def  get_dataloaders(config):
     """获取正确的域自适应数据加载器"""
     
     # 源域转换 (不使用ImageNet标准化，保持像素值在[0,1])
@@ -109,6 +109,12 @@ def get_dataloaders(config):
     )
     
     # 创建数据加载器
+    # shuffle=True：每个 epoch 开始时都会打乱数据顺序，避免模型按固定顺序学习，训练更稳定。
+    # num_workers=config.num_workers：用于数据加载的并行子进程数量。
+    #                               0 表示主进程加载（最稳但可能慢）
+    #                               >0 表示并行预取（通常更快，Linux 下常用 2/4/8 试出来）
+    # pin_memory=True：把 batch 放到锁页内存（pinned memory）里，GPU 训练时从 CPU 拷到 GPU 通常更快（配合 non_blocking=True 更明显）。
+    #                   如果只用 CPU，收益很小，可设 False。
     source_train_loader = DataLoader(
         source_train_dataset, batch_size=config.batch_size, 
         shuffle=True, num_workers=config.num_workers, pin_memory=True
@@ -135,3 +141,60 @@ def get_dataloaders(config):
     print(f"Target test: {len(target_test_loader.dataset)} images")
     
     return source_train_loader, source_val_loader, target_train_loader, target_test_loader
+
+import os
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader, ConcatDataset
+
+def get_pacs_dataloaders(config):
+    # 1. 定义数据增强 (参考 MixStyle 的标准设置)
+    train_transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(), # 注意：这里依然是 ToTensor，标准化在 evaluate 或网络内部做
+    ])
+    
+    test_transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+    ])
+
+    # 2. 加载多个源域并合并 (MSDA 核心)
+    source_datasets = []
+    for domain in config.source_domains:
+        domain_path = os.path.join(config.data_root, 'PACS', domain)
+        ds = datasets.ImageFolder(root=domain_path, transform=train_transform)
+        source_datasets.append(ds)
+    
+    # 将多个源域数据集拼接为一个巨大的训练集
+    full_source_dataset = ConcatDataset(source_datasets)
+    
+    source_loader = DataLoader(
+        full_source_dataset, 
+        batch_size=config.batch_size, 
+        shuffle=True, 
+        num_workers=config.num_workers,
+        drop_last=True
+    )
+
+    # 3. 加载目标域训练集 (用于 GMM 聚类和伪标签学习)
+    target_train_path = os.path.join(config.data_root, 'PACS', config.target_domain)
+    target_train_dataset = datasets.ImageFolder(root=target_train_path, transform=train_transform)
+    target_train_loader = DataLoader(
+        target_train_dataset, 
+        batch_size=config.batch_size, 
+        shuffle=True, 
+        num_workers=config.num_workers,
+        drop_last=True
+    )
+
+    # 4. 加载目标域测试集 (用于 evaluate)
+    target_test_dataset = datasets.ImageFolder(root=target_train_path, transform=test_transform)
+    target_test_loader = DataLoader(
+        target_test_dataset, 
+        batch_size=config.batch_size, 
+        shuffle=False, 
+        num_workers=config.num_workers
+    )
+
+    return source_loader, None, target_train_loader, target_test_loader

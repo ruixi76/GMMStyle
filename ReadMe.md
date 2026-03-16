@@ -5,7 +5,7 @@ python main.py --source_domain amazon --target_domain dslr --num_gaussians 5 --b
 2. 典型实验配置
 ```python
 # 实验1: Amazon → DSLR (标准配置)
-python main.py --source_domain amazon --target_domain dslr --num_gaussians 5 --device cuda:1
+python main.py --source_domain amazon，webcam --target_domain dslr --num_gaussians 5 --device cuda:1
 
 # 实验2: Amazon → Webcam (更具挑战性)
 python main.py --source_domain amazon --target_domain webcam --num_gaussians 7 --device cuda:1
