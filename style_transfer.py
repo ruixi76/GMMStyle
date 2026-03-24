@@ -10,7 +10,7 @@ class PixelStyleTransfer(nn.Module):
     def __init__(self, num_components=5, eps=1e-6, alpha=0.5):
         super().__init__()
         self.num_components = num_components
-        self.eps = eps
+        self.eps = eps # 避免分母为零
         self.alpha = alpha  # 保存为成员变量
     
     def forward(self, source_images, source_assignments, 
@@ -51,6 +51,7 @@ class PixelStyleTransfer(nn.Module):
             source_pixels = source_images[mask_3d].reshape(-1, C)  # [N_k, C]
             
             # 获取统计量
+            # 加 .view(1, C) 把一维的 [C] 变成了二维的 [1, C]，方便后续广播运算
             mu_s = source_stats['means'][k].view(1, C)  # [1, C]
             sigma_s = source_stats['stds'][k].view(1, C)  # [1, C]
             mu_t = target_stats['means'][k].view(1, C)  # [1, C]
@@ -58,7 +59,6 @@ class PixelStyleTransfer(nn.Module):
             
             # 应用风格迁移公式: (x - μ_s)/σ_s * σ_t + μ_t
             normalized = (source_pixels - mu_s) / (sigma_s + self.eps)
-            # styled_pixels = normalized * sigma_t + mu_t
             # alpha = 0.5 
             styled_pixels = (normalized * sigma_t + mu_t) * alpha + source_pixels * (1 - alpha)
             

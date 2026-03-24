@@ -53,15 +53,15 @@ class GMMStyleDomainAdapter:
             feature_dim=3,  # RGB
             device=config.device,
             covariance_type='diag',  # 推荐使用对角协方差
-            max_iters=config.gmm_max_iters,
-            tol=config.gmm_convergence_threshold
+            max_iters=config.gmm_max_iters, # 50
+            tol=config.gmm_convergence_threshold # 1e-3
         )
         
         # 风格迁移模块
         self.style_transfer = PixelStyleTransfer(
             num_components=config.num_gaussians,
             eps=1e-6,
-            alpha=config.style_alpha # 从配置读取
+            alpha=config.style_alpha # 从配置读取 0.5
         ).to(self.device)
         
         # 目标域统计量 (用于风格迁移)
@@ -77,43 +77,6 @@ class GMMStyleDomainAdapter:
             std=[0.229, 0.224, 0.225]
         ).to(self.device)
     
-    # def initialize_with_target_domain(self, target_loader):
-    #     """
-    #     用目标域无标签数据初始化GMM
-    #     """
-    #     print("Initializing PixelGMM with target domain data...")
-        
-    #     # 收集像素数据 (限制数量以加速)
-    #     all_pixels = []
-    #     pixel_count = 0
-    #     max_pixels = 50000  # 限制像素数量
-    #     # 如果用50000
-        
-    #     for batch_idx, (images, _, _, _) in enumerate(tqdm(target_loader, desc='Collecting target pixels')):
-    #         images = images.to(self.device)
-    #         B, C, H, W = images.shape
-            
-    #         # 转换为像素列表 [B*H*W, C]
-    #         pixels = images.permute(0, 2, 3, 1).reshape(-1, C)
-    #         all_pixels.append(pixels) # List[torch.Tensor]
-            
-    #         pixel_count += pixels.shape[0]
-    #         if pixel_count >= max_pixels:
-    #             break
-        
-    #     # 合并像素
-    #     all_pixels = torch.cat(all_pixels, dim=0) # [N_total_pixels, C]
-    #     print(f"Collected {all_pixels.shape[0]} pixels for GMM initialization")
-        
-    #     # 运行EM算法
-    #     assignments = self.target_gmm.fit(all_pixels)
-        
-    #     # 计算目标域统计量 (用于风格迁移)
-    #     self.target_stats = self.target_gmm.get_component_statistics(all_pixels, assignments)
-        
-    #     self.initialized = True
-    #     print("GMM initialization completed successfully")
-    
     def _compute_source_statistics(self, source_images, assignments):
         """
         计算源域分量级统计量
@@ -122,9 +85,10 @@ class GMMStyleDomainAdapter:
         
         # 转换为像素形式
         pixels = source_images.permute(0, 2, 3, 1).reshape(-1, C)  # [B*H*W, C]
-        flat_assignments = assignments.reshape(-1)  # [B*H*W]
+        flat_assignments = assignments.reshape(-1)  # [B * H * W]
         
         # 计算统计量
+        # 得到源域图像的各高斯分量的统计量（均值和方差以及个数）
         source_stats = self.target_gmm.get_component_statistics(pixels, flat_assignments)
         
         return source_stats
@@ -142,11 +106,15 @@ class GMMStyleDomainAdapter:
         total_samples = 0
         
         # 目标域迭代器 (用于定期更新GMM)
-        target_iter = iter(target_loader)
+        target_iter = iter(target_loader) # target_train_loader没有标签
         
         # 训练进度
+        # 如果 source_loader 原本产出的是 (图片，标签，...)，加上 enumerate 后，产出的数据变成了 (索引，(图片，标签，...))。
+        # total=len(source_loader):告诉 tqdm 总共需要迭代多少次。
+        # desc 是 "description" 的缩写，设置进度条左侧的描述文字。
         pbar = tqdm(enumerate(source_loader), total=len(source_loader), desc=f'Epoch {epoch+1}')
         
+        # 从 enumerate(source_loader) 中取出一个元组，结构是：(batch_idx, batch_data)。
         for batch_idx, (source_images, labels, _, _) in pbar:
             source_images = source_images.to(self.device)
             labels = labels.to(self.device)
@@ -154,7 +122,7 @@ class GMMStyleDomainAdapter:
 
             try:
                 # 获取一个 batch 的目标域数据
-                target_images, _, _, _ = next(target_iter)
+                target_images, _, _, _ = next(target_iter) # target_train_loader没有标签
             except StopIteration:
                 # 如果遍历完了，重新开始
                 target_iter = iter(target_loader)
@@ -164,22 +132,21 @@ class GMMStyleDomainAdapter:
 
             if not self.target_gmm.initialized:
                 print("\n[Train] Lazy initializing GMM with the first target batch...")
-                # 将图像展平为像素
+                # 将图像展平为像素 B,C,H,W->B,H,W,C->B*H*W,C
                 target_pixels = target_images.permute(0, 2, 3, 1).reshape(-1, 3)
                 
                 # 使用 fit 进行初始化 (内部现在会调用 K-Means)
                 # max_iters=20 足够快速收敛
-                assignments = self.target_gmm.fit(target_pixels, max_iters=20)
+                # # fit 内部会调用 K-Means 来初始化 GMM 参数，然后再进行 EM 迭代优化
+                assignments = self.target_gmm.fit(target_pixels, max_iters=20) # assignments是一个长度为N的张量，表示每个像素被分配到的分量索引（从 0 到 num_components-1）。
                 
                 # 初始化 target_stats
                 self.target_stats = self.target_gmm.get_component_statistics(target_pixels, assignments)
                 self.initialized = True
                 print("[Train] GMM initialized successfully.")
-            
-            # source_images = self.normalize(source_images)
-            # target_images = self.normalize(target_images)
 
             # 1. 像素级分配到GMM分量
+            # assignments 是一个维度为[B,H,W]的张量，表示每个像素被分配到的分量索引（从 0 到 num_components-1）。
             assignments, _ = self.target_gmm.predict(source_images)  # [B, H, W]
             
             # 2. 计算源域分量统计量
@@ -196,6 +163,7 @@ class GMMStyleDomainAdapter:
             # styled_images = self.normalize(styled_images)
             
             # 4. 前向传播
+            # 清空上一个 Batch 残留的梯度（像计算器归零）。
             self.optimizer.zero_grad()
             
             # 原始源域图像

@@ -50,7 +50,7 @@ class Config:
                                help='Batch size')
         self.parser.add_argument('--num_workers', type=int, default=4, 
                                help='Number of workers for data loading')
-        self.parser.add_argument('--epochs', type=int, default=50, 
+        self.parser.add_argument('--epochs', type=int, default=10, 
                                help='Number of training epochs')
         self.parser.add_argument('--lr', type=float, default=0.001, 
                                help='Learning rate')

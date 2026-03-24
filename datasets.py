@@ -59,6 +59,7 @@ def  get_dataloaders(config):
         transforms.Resize((256, 256)),
         transforms.RandomCrop(224),
         transforms.RandomHorizontalFlip(),
+        # ToTensor() 的内部机制不仅是将 numpy 数组或 PIL 图像转成 Tensor，它还会自动将 0-255 的整数除以 255.0，将其压缩到 [0.0, 1.0] 范围的浮点数。
         transforms.ToTensor(),  # 输出范围[0,1]
     ])
     
