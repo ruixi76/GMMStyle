@@ -196,6 +196,7 @@ class PixelGaussianMixture:
             
             if self.covariance_type == 'diag':
                 # 仅更新对角元素 (通道独立假设)
+                # diff ** 2 是 PyTorch 的逐元素平方
                 weighted_var = torch.sum(resp_k.unsqueeze(1) * (diff ** 2), dim=0) / Nk
                 new_covariances[k] = torch.diag(weighted_var.clamp(min=1e-4))
             else:
@@ -359,24 +360,15 @@ class PixelGaussianMixture:
                 # 更新协方差 (简化: 仅更新对角元素)
                 if self.covariance_type == 'diag':
                     new_var = new_stats['stds'][k] ** 2
+                    # torch.diagonal 的作用是提取一个矩阵的主对角线元素，并将其返回成一个一维（1D）张量。
                     old_var = torch.diagonal(self.covariances[k])
                     updated_var = alpha * old_var + (1 - alpha) * new_var
                     self.covariances[k] = torch.diag(updated_var)
                 
-                # # 更新权重 (基于计数)
-                # total_count = self.weights[k] * 1000 + new_stats['counts'][k]  # 假设历史有1000个样本
-                # self.weights[k] = (self.weights[k] * 1000 * alpha + new_stats['counts'][k] * (1 - alpha)) / total_count
-                # --- 步骤 A: 计算当前 Batch 中该簇的占比 ---
-                # current_batch_weight 即 π_{k, batch}
+                # 更新权重
                 current_batch_weight = new_stats['counts'][k] / batch_total_count
-                
-                # --- 步骤 B: 动量更新 (EMA) ---
-                # self.weights[k] 是历史积累的权重
-                # alpha 是动量 (如 0.9), (1-alpha) 是学习率
                 self.weights[k] = self.weights[k] * alpha + current_batch_weight * (1 - alpha)
         
-        # 确保权重和为1
-        # self.weights = self.weights / torch.sum(self.weights)
         # 3. 归一化 (Normalization) - 非常重要！
         # 经过多次独立更新后，权重之和可能略微偏离 1.0，必须重新归一化
         self.weights = self.weights / self.weights.sum()
