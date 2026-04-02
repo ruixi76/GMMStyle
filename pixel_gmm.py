@@ -6,7 +6,7 @@ from tqdm import tqdm
 # 引入 sklearn 进行 K-Means 初始化
 from sklearn.cluster import KMeans
 
-class PixelGaussianMixture:
+class PixelGaussianMixture(nn.Module):
     """
     像素级高斯混合模型 - 纯PyTorch实现，避免CPU/GPU切换
     理论基础: p(x) = Σ_k π_k * N(x|μ_k, Σ_k)
@@ -22,6 +22,7 @@ class PixelGaussianMixture:
             max_iters: EM算法最大迭代次数
             tol: 收敛阈值
         """
+        super().__init__()
         self.num_components = num_components
         self.feature_dim = feature_dim
         self.device = torch.device(device)
@@ -33,6 +34,7 @@ class PixelGaussianMixture:
         self.means = None          # [k, C] - 每个分量的均值向量
         self.covariances = None    # [k, C, C] - 每个分量的协方差矩阵
         self.weights = None        # [k] - 混合权重
+        self.last_log_likelihood = None
         
         # 初始化为None，等待数据初始化
         self.initialized = False
@@ -215,8 +217,10 @@ class PixelGaussianMixture:
         self.means = new_means.detach()
         self.covariances = new_covariances.detach()
         self.weights = new_weights.detach()
+
+        return new_means, new_covariances, new_weights
     
-    def fit(self, pixels, max_iters=None):
+    def fit(self, pixels, max_iters=None, return_details=False):
         """
         使用EM算法拟合GMM
         Args:
@@ -224,42 +228,48 @@ class PixelGaussianMixture:
             max_iters: 最大迭代次数 (覆盖初始化时的设置)
         Returns:
             assignments: 每个像素的分量分配 [N]
+            details (optional): 包含 responsibilities 和 log_likelihood
         """
-        if not self.initialized:
-            self._initialize_parameters(pixels)
+        
+        self._initialize_parameters(pixels)
         
         max_iters = max_iters or self.max_iters
-        prev_log_likelihood = float('-inf') # 负无穷大
-        log_likelihoods = []
+        log_likelihood_old = float('-inf') # 负无穷大
         
         print(f"[PixelGMM] Running EM algorithm for {max_iters} iterations...")
 
-        pbar= tqdm(range(max_iters), desc='EM Iterations')
+        pbar = tqdm(range(max_iters), desc='EM Iterations')
+        log_likelihood_new = log_likelihood_old
         for i in pbar:
             # E步
-            responsibilities, log_likelihood = self.e_step(pixels)
-            log_likelihoods.append(log_likelihood)
-            
-            # 检查收敛
-            if i > 0 and abs(log_likelihood - prev_log_likelihood) < self.tol:
-                print(f"EM converged at iteration {i+1}")
-                break
-            
-            prev_log_likelihood = log_likelihood
+            responsibilities, log_likelihood_new = self.e_step(pixels)
             
             # M步：根据E步计算的责任矩阵更新GMM参数（均值，协方差，权重）
             self.m_step(pixels, responsibilities)
-        
+            
+            # 检查收敛
+            if i > 0 and abs(log_likelihood_new - log_likelihood_old) < self.tol:
+                print(f"EM converged at iteration {i+1}")
+                break
+            log_likelihood_old = log_likelihood_new
+
         # 最终分配: 每个像素分配到概率最高的分量
         # 硬分配：尝试着改一下试试
         assignments = torch.argmax(responsibilities, dim=1)  # [N]
-        print(f"[PixelGMM] EM completed. Final log-likelihood: {log_likelihood:.4f}")
+        self.last_log_likelihood = log_likelihood_new
+        print(f"[PixelGMM] EM completed. Final log-likelihood: {log_likelihood_new:.4f}")
         # np.bincount 是 NumPy 中用来统计非负整数出现频次的快捷函数。它就像是在做“点名统计”。
         # torch.bincount 是 PyTorch 中的一个函数，用于统计非负整数在一个一维张量中出现的频次。它的用法和 NumPy 的 np.bincount 类似，但适用于 PyTorch 张量。
         # 例如，如果你有一个张量 assignments，其中包含了每个像素被分配到的分量索引（从 0 到 k-1），你可以使用 torch.bincount(assignments) 来统计每个分量被分配到的像素数量。
         # minlength=self.num_components 参数确保输出的计数数组至少有 num_components 个元素，即使某些分量没有被分配到任何像素，也会在对应位置返回 0。
         print(f"Component assignments: {torch.bincount(assignments, minlength=self.num_components).cpu().numpy()}")
         
+        if return_details:
+            return assignments, {
+                'responsibilities': responsibilities,
+                'log_likelihood': log_likelihood_new
+            }
+
         return assignments
     
     def predict(self, pixels):
@@ -324,6 +334,38 @@ class PixelGaussianMixture:
                 component_stats['stds'][k] = torch.std(pixels_k, dim=0) + 1e-8
         
         return component_stats
+
+    def get_soft_component_statistics(self, pixels, responsibilities):
+        """
+        基于软分配责任矩阵计算每个分量的统计量。
+        Args:
+            pixels: [N, C]
+            responsibilities: [N, K]
+        Returns:
+            component_stats: {
+                'means': [K, C],
+                'stds': [K, C],
+                'counts': [K]
+            }
+        """
+        component_stats = {
+            'means': torch.zeros(self.num_components, self.feature_dim, device=self.device),
+            'stds': torch.zeros(self.num_components, self.feature_dim, device=self.device),
+            'counts': torch.zeros(self.num_components, device=self.device)
+        }
+
+        for k in range(self.num_components):
+            gamma_k = responsibilities[:, k]
+            Nk = torch.sum(gamma_k) + 1e-8
+            component_stats['counts'][k] = Nk
+
+            mean_k = torch.sum(gamma_k.unsqueeze(1) * pixels, dim=0) / Nk
+            var_k = torch.sum(gamma_k.unsqueeze(1) * (pixels - mean_k) ** 2, dim=0) / Nk
+
+            component_stats['means'][k] = mean_k
+            component_stats['stds'][k] = torch.sqrt(var_k.clamp(min=1e-8))
+
+        return component_stats
     
     def update_incremental(self, new_pixels, alpha=0.9):
         """
@@ -373,3 +415,35 @@ class PixelGaussianMixture:
         # 经过多次独立更新后，权重之和可能略微偏离 1.0，必须重新归一化
         self.weights = self.weights / self.weights.sum()
         print(f"[PixelGMM] Incremental update completed with alpha={alpha}")
+
+    def online_em_update(self, new_pixels, tau=0.9):
+        """
+        对当前批次执行 1 次 EM，再用 EMA 融合到历史参数。
+        Args:
+            new_pixels: [N, C]
+            tau: EMA 系数，越大越依赖历史
+        Returns:
+            log_likelihood: 当前批次 E 步对数似然
+        """
+        if not self.initialized:
+            _, details = self.fit(new_pixels, max_iters=20, return_details=True)
+            return details['log_likelihood']
+
+        responsibilities, log_likelihood = self.e_step(new_pixels)
+        new_means, new_covariances, new_weights = self.m_step(new_pixels, responsibilities)
+
+        self.means = tau * self.means + (1.0 - tau) * new_means
+        self.covariances = tau * self.covariances + (1.0 - tau) * new_covariances
+        self.weights = tau * self.weights + (1.0 - tau) * new_weights
+        self.weights = self.weights / (self.weights.sum() + 1e-10)
+
+        self.last_log_likelihood = log_likelihood
+        return log_likelihood
+
+    def get_bic(self, pixels, max_iters=None):
+        """计算当前数据上的 BIC（会重新拟合一次）。"""
+        _, details = self.fit(pixels, max_iters=max_iters, return_details=True)
+        log_l = details['log_likelihood']
+        n_samples = pixels.shape[0]
+        m = (self.num_components - 1) + self.num_components * self.feature_dim * 2
+        return m * np.log(n_samples) - 2.0 * log_l

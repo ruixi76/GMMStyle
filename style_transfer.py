@@ -13,14 +13,14 @@ class PixelStyleTransfer(nn.Module):
         self.eps = eps # 避免分母为零
         self.alpha = alpha  # 保存为成员变量
     
-    def forward(self, source_images, source_assignments, 
+    def forward(self, source_images, responsibilities,
                 source_stats, target_stats, alpha=None):
         """
         批次级风格迁移 (按GMM分量分组)
         
         Args:
             source_images: 源域图像 [B, C, H, W]
-            source_assignments: 像素分量分配 [B, H, W]
+            responsibilities: 责任矩阵 [B, H, W, K]
             source_stats: 源域分量统计 {'means': [k, C], 'stds': [k, C]}
             target_stats: 目标域分量统计 {'means': [k, C], 'stds': [k, C]}
         
@@ -31,41 +31,95 @@ class PixelStyleTransfer(nn.Module):
         if alpha is None:
             alpha = self.alpha
 
-        B, C, H, W = source_images.shape
-        device = source_images.device
-        
-        # 创建输出张量
-        styled_images = torch.zeros_like(source_images)
-        
-        # 按分量处理
-        for k in range(self.num_components):
-            # 创建分量掩码 [B, H, W]
-            mask_2d = (source_assignments == k)
-            if torch.sum(mask_2d) == 0:
-                continue
-            
-            # 扩展为3通道掩码 [B, C, H, W]
-            mask_3d = mask_2d.unsqueeze(1).expand(-1, C, -1, -1)
-            
-            # 提取该分量的源域像素
-            source_pixels = source_images[mask_3d].reshape(-1, C)  # [N_k, C]
-            
-            # 获取统计量
-            # 加 .view(1, C) 把一维的 [C] 变成了二维的 [1, C]，方便后续广播运算
-            mu_s = source_stats['means'][k].view(1, C)  # [1, C]
-            sigma_s = source_stats['stds'][k].view(1, C)  # [1, C]
-            mu_t = target_stats['means'][k].view(1, C)  # [1, C]
-            sigma_t = target_stats['stds'][k].view(1, C)  # [1, C]
-            
-            # 应用风格迁移公式: (x - μ_s)/σ_s * σ_t + μ_t
-            normalized = (source_pixels - mu_s) / (sigma_s + self.eps)
-            # alpha = 0.5 
-            styled_pixels = (normalized * sigma_t + mu_t) * alpha + source_pixels * (1 - alpha)
-            
-            # 写回输出张量
-            styled_images[mask_3d] = styled_pixels.reshape(-1)
+        bsz, channels, h, w = source_images.shape
+        num_components = responsibilities.shape[-1]
+        if num_components != self.num_components:
+            raise ValueError(
+                f"responsibilities components ({num_components}) != num_components ({self.num_components})"
+            )
+
+        # [B, H, W, C]
+        source_nhwc = source_images.permute(0, 2, 3, 1)
+
+        # 广播成 [1, 1, 1, K, C]
+        mu_s = source_stats['means'].view(1, 1, 1, self.num_components, channels)
+        sigma_s = source_stats['stds'].view(1, 1, 1, self.num_components, channels)
+        mu_t = target_stats['means'].view(1, 1, 1, self.num_components, channels)
+        sigma_t = target_stats['stds'].view(1, 1, 1, self.num_components, channels)
+
+        # 扩展像素到 [B, H, W, 1, C]，对每个 k 计算候选风格化结果
+        source_expand = source_nhwc.unsqueeze(3)
+        candidates = ((source_expand - mu_s) / (sigma_s + self.eps)) * sigma_t + mu_t
+
+        # 软分配融合: x_style = Σ_k γ_nk * x_hat_nk
+        gamma = responsibilities.unsqueeze(-1)  # [B, H, W, K, 1]
+        styled_nhwc = torch.sum(gamma * candidates, dim=3)
+
+        # 内容保留混合: x_final = alpha*x_style + (1-alpha)*x_source
+        styled_nhwc = alpha * styled_nhwc + (1.0 - alpha) * source_nhwc
+
+        styled_images = styled_nhwc.permute(0, 3, 1, 2)
         
         # 确保像素值在[0,1]范围内
         styled_images = torch.clamp(styled_images, 0.0, 1.0)
         
         return styled_images
+
+
+class FeatureStyleTransfer(nn.Module):
+    """特征级 WCT 风格迁移，按分量仿射变换后用软分配融合。"""
+
+    def __init__(self, num_components=5, eps=1e-5):
+        super().__init__()
+        self.num_components = num_components
+        self.eps = eps
+
+    def _safe_wct_matrix(self, cov_s, cov_t):
+        eye = torch.eye(cov_s.size(0), device=cov_s.device, dtype=cov_s.dtype)
+        cov_s = cov_s + self.eps * eye
+        cov_t = cov_t + self.eps * eye
+
+        eval_s, evec_s = torch.linalg.eigh(cov_s)
+        eval_t, evec_t = torch.linalg.eigh(cov_t)
+
+        eval_s = torch.clamp(eval_s, min=self.eps)
+        eval_t = torch.clamp(eval_t, min=self.eps)
+
+        ds_inv_sqrt = torch.diag(torch.rsqrt(eval_s))
+        dt_sqrt = torch.diag(torch.sqrt(eval_t))
+
+        whiten = evec_s @ ds_inv_sqrt @ evec_s.T
+        color = evec_t @ dt_sqrt @ evec_t.T
+        return color @ whiten
+
+    def forward(self, source_features, responsibilities, source_stats, target_stats):
+        """
+        Args:
+            source_features: [B, D]
+            responsibilities: [B, K]
+            source_stats: {'means':[K,D], 'covariances':[K,D,D]}
+            target_stats: {'means':[K,D], 'covariances':[K,D,D]}
+        Returns:
+            stylized_features: [B, D]
+        """
+        batch_size, feat_dim = source_features.shape
+        if responsibilities.shape[-1] != self.num_components:
+            raise ValueError("Feature responsibilities shape mismatch with num_components")
+
+        candidates = []
+        for k in range(self.num_components):
+            mu_s = source_stats['means'][k]
+            mu_t = target_stats['means'][k]
+            cov_s = source_stats['covariances'][k]
+            cov_t = target_stats['covariances'][k]
+
+            w_k = self._safe_wct_matrix(cov_s, cov_t)
+            b_k = mu_t - w_k @ mu_s
+            xk = source_features @ w_k.T + b_k.view(1, feat_dim)
+            candidates.append(xk)
+
+        # [B, K, D]
+        candidates = torch.stack(candidates, dim=1)
+        gamma = responsibilities.unsqueeze(-1)
+        stylized_features = torch.sum(gamma * candidates, dim=1)
+        return stylized_features

@@ -7,25 +7,6 @@ class FeatureExtractor(nn.Module):
     def __init__(self, backbone='resnet50', pretrained=True, use_mixstyle=False):
         super().__init__()
         self.use_mixstyle = use_mixstyle
-        
-        # if backbone == 'resnet18':
-        #     self.backbone = models.resnet18(pretrained=pretrained)
-        #     feature_dim = 512
-        # elif backbone == 'resnet50':
-        #     self.backbone = models.resnet50(pretrained=pretrained)
-        #     feature_dim = 2048
-        # elif backbone == 'vgg16':
-        #     self.backbone = models.vgg16(pretrained=pretrained)
-        #     feature_dim = 4096
-        # else:
-        #     raise ValueError(f"Unsupported backbone: {backbone}")
-        
-        # # 移除分类层
-        # if backbone.startswith('resnet'):
-        #     self.backbone = nn.Sequential(*list(self.backbone.children())[:-1])
-        # elif backbone.startswith('vgg'):
-        #     self.backbone = nn.Sequential(*list(self.backbone.features.children()))
-        #     self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
 
         if backbone == 'resnet50':
             resnet = models.resnet50(pretrained=pretrained)
@@ -49,19 +30,8 @@ class FeatureExtractor(nn.Module):
         if self.use_mixstyle:
             self.mixstyle1 = MixStyle(p=0.5, alpha=0.1, mix='crossdomain')
             self.mixstyle2 = MixStyle(p=0.5, alpha=0.1, mix='crossdomain')
-        
-        # self.feature_dim = feature_dim
-        # self.backbone_name = backbone
     
     def forward(self, x):
-        # if self.backbone_name.startswith('resnet'):
-        #     features = self.backbone(x)
-        #     features = features.view(features.size(0), -1)
-        # elif self.backbone_name.startswith('vgg'):
-        #     features = self.backbone(x)
-        #     features = self.avgpool(features)
-        #     features = features.view(features.size(0), -1)
-        
         x = self.conv1(x)
         x = self.bn1(x)
         x = self.relu(x)
@@ -104,8 +74,18 @@ class DomainAdapter(nn.Module):
             feature_dim=self.feature_extractor.feature_dim,
             num_classes=config.num_classes
         )
+
+    @property
+    def feature_dim(self):
+        return self.feature_extractor.feature_dim
+
+    def extract_features(self, x):
+        return self.feature_extractor(x)
+
+    def classify_features(self, features):
+        return self.classifier(features)
     
     def forward(self, x):
-        features = self.feature_extractor(x)
-        logits = self.classifier(features)
+        features = self.extract_features(x)
+        logits = self.classify_features(features)
         return logits, features

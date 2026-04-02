@@ -56,7 +56,9 @@ def load_checkpoint(checkpoint_path, config, device):
         target_stats = {
             'means': checkpoint['target_stats']['means'].to(device),
             'stds': checkpoint['target_stats']['stds'].to(device),
-            'counts': checkpoint['target_stats']['counts'].to(device)
+            'counts': checkpoint['target_stats'].get(
+                'counts', torch.zeros(config.num_gaussians, device=device)
+            ).to(device)
         }
         print("Target domain statistics loaded")
     
@@ -85,7 +87,7 @@ def evaluate(model, gmm, target_stats, dataloader, device, config, save_dir='./e
     normalize = transforms.Normalize(
         mean=[0.485, 0.456, 0.406], 
         std=[0.229, 0.224, 0.225]
-    ).to(device)
+    )
     
     with torch.no_grad():
         for batch_idx, (images, labels, _, _) in enumerate(tqdm(dataloader, desc='Evaluating')):
@@ -93,29 +95,18 @@ def evaluate(model, gmm, target_stats, dataloader, device, config, save_dir='./e
             labels = labels.to(device)
             
             # 1. 像素级分配
-            assignments, _ = gmm.predict(images)
+            assignments, probabilities = gmm.predict(images)
             
             # 2. 风格迁移（可选：评估风格迁移后的性能）
             if target_stats is not None:
                 # 计算源域统计量
                 B, C, H, W = images.shape
                 pixels = images.permute(0, 2, 3, 1).reshape(-1, C)
-                flat_assignments = assignments.reshape(-1)
-                
-                source_stats = {
-                    'means': torch.zeros(config.num_gaussians, C, device=device),
-                    'stds': torch.zeros(config.num_gaussians, C, device=device)
-                }
-                
-                for k in range(config.num_gaussians):
-                    mask = (flat_assignments == k)
-                    if torch.sum(mask) > 0:
-                        pixels_k = pixels[mask]
-                        source_stats['means'][k] = torch.mean(pixels_k, dim=0)
-                        source_stats['stds'][k] = torch.std(pixels_k, dim=0) + 1e-8
+                flat_probs = probabilities.reshape(-1, config.num_gaussians)
+                source_stats = gmm.get_soft_component_statistics(pixels, flat_probs)
                 
                 # 风格迁移
-                styled_images = style_transfer(images, assignments, source_stats, target_stats)
+                styled_images = style_transfer(images, probabilities, source_stats, target_stats)
                 inputs = styled_images
             else:
                 inputs = images

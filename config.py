@@ -39,8 +39,12 @@ class Config:
                                help='Convergence threshold for EM algorithm')
         self.parser.add_argument('--gmm_max_iters', type=int, default=50, 
                                help='Maximum iterations for EM algorithm')
+        self.parser.add_argument('--gmm_init_iters', type=int, default=20,
+                       help='Warmup EM iterations for first target batch')
         self.parser.add_argument('--momentum', type=float, default=0.9, 
                                help='Momentum for incremental GMM updates')
+        self.parser.add_argument('--gmm_ema_tau', type=float, default=0.9,
+                       help='EMA factor for online EM updates (larger means more history)')
         self.parser.add_argument('--covariance_type', type=str, default='diag', 
                                choices=['diag', 'full'],
                                help='Covariance type: diag (faster) or full (more accurate)')
@@ -60,6 +64,21 @@ class Config:
                                help='Weight decay')
         self.parser.add_argument('--lambda_div', type=float, default=1.0, 
                                help='Weight for diversity loss (style transferred images)')
+        self.parser.add_argument('--style_mode', type=str, default='both',
+                       choices=['pixel', 'feature', 'both'],
+                       help='Style transfer mode: pixel, feature, or both')
+        self.parser.add_argument('--lambda_pixel', type=float, default=1.0,
+                       help='Weight for pixel-level style loss')
+        self.parser.add_argument('--lambda_feature', type=float, default=1.0,
+                       help='Weight for feature-level style loss')
+        self.parser.add_argument('--auto_select_k', action='store_true',
+                       help='Automatically select K via BIC before training')
+        self.parser.add_argument('--bic_k_candidates', type=str, default='3,5,7',
+                       help='Comma-separated candidate K values for BIC selection')
+        self.parser.add_argument('--bic_num_batches', type=int, default=1,
+                       help='Number of target batches to use for BIC warmup')
+        self.parser.add_argument('--bic_em_iters', type=int, default=15,
+                       help='EM iterations for each BIC candidate')
         
         # 其他配置
         self.parser.add_argument('--seed', type=int, default=42, 
@@ -72,9 +91,24 @@ class Config:
                                help='Device to use (e.g., cuda:1 for GPU 1)')
         self.parser.add_argument('--style_alpha', type=float, default=0.5, 
                        help='Strength of style transfer (0.0 to 1.0)')
+        self.parser.add_argument('--style_alpha_start', type=float, default=0.3,
+                   help='Initial style alpha for curriculum schedule')
+        self.parser.add_argument('--style_alpha_end', type=float, default=0.8,
+                   help='Final style alpha for curriculum schedule')
+        self.parser.add_argument('--style_alpha_warmup_epochs', type=int, default=10,
+                   help='Number of epochs to linearly increase style alpha')
     
     def parse(self):
         args = self.parser.parse_args()
+
+        # 解析 BIC 候选 K
+        args.bic_k_candidates = [
+            int(k.strip()) for k in args.bic_k_candidates.split(',') if k.strip()
+        ]
+
+        # 向后兼容: 若未单独设置 pixel 权重，沿用原 lambda_div
+        if not hasattr(args, 'lambda_pixel'):
+            args.lambda_pixel = args.lambda_div
         
         # 处理GPU设备映射
         if args.device.startswith('cuda:'):
