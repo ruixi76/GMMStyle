@@ -138,10 +138,10 @@ class GMMStyleDomainAdapter:
                 # 使用 fit 进行初始化 (内部现在会调用 K-Means)
                 # max_iters=20 足够快速收敛
                 # # fit 内部会调用 K-Means 来初始化 GMM 参数，然后再进行 EM 迭代优化
-                assignments = self.target_gmm.fit(target_pixels, max_iters=20) # assignments是一个长度为N的张量，表示每个像素被分配到的分量索引（从 0 到 num_components-1）。
+                responsibilities = self.target_gmm.fit(target_pixels, max_iters=20)
                 
                 # 初始化 target_stats
-                self.target_stats = self.target_gmm.get_component_statistics(target_pixels, assignments)
+                self.target_stats = self.target_gmm.get_component_statistics(target_pixels, responsibilities)
                 self.initialized = True
                 print("[Train] GMM initialized successfully.")
 

@@ -216,14 +216,15 @@ class PixelGaussianMixture:
         self.covariances = new_covariances.detach()
         self.weights = new_weights.detach()
     
-    def fit(self, pixels, max_iters=None):
+    def fit(self, pixels, max_iters=None, return_hard=False):
         """
         使用EM算法拟合GMM
         Args:
             pixels: 像素数据 [N, C]
             max_iters: 最大迭代次数 (覆盖初始化时的设置)
         Returns:
-            assignments: 每个像素的分量分配 [N]
+            responsibilities: 软分配责任矩阵 [N, k]
+            或 assignments: 硬分配结果 [N] (当 return_hard=True)
         """
         if not self.initialized:
             self._initialize_parameters(pixels)
@@ -250,17 +251,14 @@ class PixelGaussianMixture:
             # M步：根据E步计算的责任矩阵更新GMM参数（均值，协方差，权重）
             self.m_step(pixels, responsibilities)
         
-        # 最终分配: 每个像素分配到概率最高的分量
-        # 硬分配：尝试着改一下试试
-        assignments = torch.argmax(responsibilities, dim=1)  # [N]
         print(f"[PixelGMM] EM completed. Final log-likelihood: {log_likelihood:.4f}")
-        # np.bincount 是 NumPy 中用来统计非负整数出现频次的快捷函数。它就像是在做“点名统计”。
-        # torch.bincount 是 PyTorch 中的一个函数，用于统计非负整数在一个一维张量中出现的频次。它的用法和 NumPy 的 np.bincount 类似，但适用于 PyTorch 张量。
-        # 例如，如果你有一个张量 assignments，其中包含了每个像素被分配到的分量索引（从 0 到 k-1），你可以使用 torch.bincount(assignments) 来统计每个分量被分配到的像素数量。
-        # minlength=self.num_components 参数确保输出的计数数组至少有 num_components 个元素，即使某些分量没有被分配到任何像素，也会在对应位置返回 0。
-        print(f"Component assignments: {torch.bincount(assignments, minlength=self.num_components).cpu().numpy()}")
         
-        return assignments
+        if return_hard:
+            assignments = torch.argmax(responsibilities, dim=1)  # [N]
+            print(f"Component assignments: {torch.bincount(assignments, minlength=self.num_components).cpu().numpy()}")
+            return assignments
+
+        return responsibilities
     
     def predict(self, pixels):
         """
@@ -298,7 +296,7 @@ class PixelGaussianMixture:
         注意: 这些统计量不同于GMM参数!
         Args:
             pixels: 像素数据 [N, C]
-            assignments: 像素分配 [N]
+            assignments: 像素分配 [N] 或软分配责任矩阵 [N, k]
         Returns:
             component_stats: {
                 'means': [k, C] - 每个分量的通道均值,
@@ -311,17 +309,32 @@ class PixelGaussianMixture:
             'counts': torch.zeros(self.num_components, device=self.device)
         }
         
-        for k in range(self.num_components):
-            mask = (assignments == k)
-            count_k = torch.sum(mask.float())
-            component_stats['counts'][k] = count_k
-            
-            if count_k > 0:
-                pixels_k = pixels[mask]
-                # 通道级均值 (风格统计量)
-                component_stats['means'][k] = torch.mean(pixels_k, dim=0)
-                # 通道级标准差 (风格统计量，从数据计算，非从协方差矩阵提取)
-                component_stats['stds'][k] = torch.std(pixels_k, dim=0) + 1e-8
+        # 软分配: assignments [N, k]
+        if assignments.dim() == 2:
+            responsibilities = assignments
+            for k in range(self.num_components):
+                resp_k = responsibilities[:, k]
+                count_k = torch.sum(resp_k)
+                component_stats['counts'][k] = count_k
+                
+                if count_k > 0:
+                    mean_k = torch.sum(resp_k.unsqueeze(1) * pixels, dim=0) / (count_k + 1e-10)
+                    var_k = torch.sum(resp_k.unsqueeze(1) * (pixels - mean_k) ** 2, dim=0) / (count_k + 1e-10)
+                    component_stats['means'][k] = mean_k
+                    component_stats['stds'][k] = torch.sqrt(var_k + 1e-8)
+        else:
+            # 硬分配: assignments [N]
+            for k in range(self.num_components):
+                mask = (assignments == k)
+                count_k = torch.sum(mask.float())
+                component_stats['counts'][k] = count_k
+                
+                if count_k > 0:
+                    pixels_k = pixels[mask]
+                    # 通道级均值 (风格统计量)
+                    component_stats['means'][k] = torch.mean(pixels_k, dim=0)
+                    # 通道级标准差 (风格统计量，从数据计算，非从协方差矩阵提取)
+                    component_stats['stds'][k] = torch.std(pixels_k, dim=0) + 1e-8
         
         return component_stats
     
