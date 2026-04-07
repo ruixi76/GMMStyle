@@ -27,7 +27,7 @@ class PixelGaussianMixture(nn.Module):
         self.feature_dim = feature_dim
         self.device = torch.device(device)
         self.covariance_type = covariance_type
-        self.max_iters = max_iters
+        self.max_iters = max_iters # 50
         self.tol = tol # 收敛阈值
         
         # GMM参数 (全部在GPU上)
@@ -206,6 +206,7 @@ class PixelGaussianMixture(nn.Module):
                 weighted_outer = torch.zeros(self.feature_dim, self.feature_dim, device=self.device)
                 for i in range(min(N, 1000)):  # 限制计算量
                     if resp_k[i] > 1e-8:
+                        # torch.outer 的含义是“外积”。它接收两个一维向量，返回一个二维矩阵，矩阵中第 i 行第 j 列元素等于这两个向量对应元素相乘。
                         outer = torch.outer(diff[i], diff[i])
                         weighted_outer += resp_k[i] * outer
                 new_covariances[k] = weighted_outer / Nk + 1e-6 * torch.eye(self.feature_dim, device=self.device)
@@ -220,21 +221,22 @@ class PixelGaussianMixture(nn.Module):
 
         return new_means, new_covariances, new_weights
     
-    def fit(self, pixels, max_iters=None, return_details=False):
+    def fit(self, pixels, max_iters=None, return_details=False, compute_hard_assignments=False):
         """
         使用EM算法拟合GMM
         Args:
             pixels: 像素数据 [N, C]
             max_iters: 最大迭代次数 (覆盖初始化时的设置)
         Returns:
-            assignments: 每个像素的分量分配 [N]
+            responsibilities 或 assignments (取决于 compute_hard_assignments)
             details (optional): 包含 responsibilities 和 log_likelihood
         """
-        
+        # 初始化gmm参数（如果还没有初始化的话）
         self._initialize_parameters(pixels)
         
-        max_iters = max_iters or self.max_iters
-        log_likelihood_old = float('-inf') # 负无穷大
+        # Python 里 or 的返回规则是：左边为真，返回左边；左边为假，返回右边
+        # 若max_iters参数为None，则使用self.max_iters的值（即初始化时设置的默认值）。如果 max_iters 参数被显式传入了一个整数值，那么就使用这个值。
+        max_iters = max_iters or self.max_iters 
         
         print(f"[PixelGMM] Running EM algorithm for {max_iters} iterations...")
 
@@ -253,24 +255,35 @@ class PixelGaussianMixture(nn.Module):
                 break
             log_likelihood_old = log_likelihood_new
 
-        # 最终分配: 每个像素分配到概率最高的分量
-        # 硬分配：尝试着改一下试试
-        assignments = torch.argmax(responsibilities, dim=1)  # [N]
         self.last_log_likelihood = log_likelihood_new
         print(f"[PixelGMM] EM completed. Final log-likelihood: {log_likelihood_new:.4f}")
-        # np.bincount 是 NumPy 中用来统计非负整数出现频次的快捷函数。它就像是在做“点名统计”。
-        # torch.bincount 是 PyTorch 中的一个函数，用于统计非负整数在一个一维张量中出现的频次。它的用法和 NumPy 的 np.bincount 类似，但适用于 PyTorch 张量。
-        # 例如，如果你有一个张量 assignments，其中包含了每个像素被分配到的分量索引（从 0 到 k-1），你可以使用 torch.bincount(assignments) 来统计每个分量被分配到的像素数量。
-        # minlength=self.num_components 参数确保输出的计数数组至少有 num_components 个元素，即使某些分量没有被分配到任何像素，也会在对应位置返回 0。
-        print(f"Component assignments: {torch.bincount(assignments, minlength=self.num_components).cpu().numpy()}")
+        assignments = None
+        hard_counts = None
+        if compute_hard_assignments:
+            # 仅在显式需要硬分配时才执行 argmax
+            # 最终分配: 每个像素分配到概率最高的分量
+            assignments = torch.argmax(responsibilities, dim=1)  # [N]
+            # np.bincount 是 NumPy 中用来统计非负整数出现频次的快捷函数。它就像是在做“点名统计”。
+            # torch.bincount 是 PyTorch 中的一个函数，用于统计非负整数在一个一维张量中出现的频次。它的用法和 NumPy 的 np.bincount 类似，但适用于 PyTorch 张量。
+            # 例如，如果你有一个张量 assignments，其中包含了每个像素被分配到的分量索引（从 0 到 k-1），你可以使用 torch.bincount(assignments) 来统计每个分量被分配到的像素数量。
+            # minlength=self.num_components 参数确保输出的计数数组至少有 num_components 个元素，即使某些分量没有被分配到任何像素，也会在对应位置返回 0。
+            hard_counts = torch.bincount(assignments, minlength=self.num_components)
+            print(f"Component assignments: {hard_counts.cpu().numpy()}")
+        else:
+            # 软分配统计更符合 soft-style transfer 的主流程
+            soft_counts = torch.sum(responsibilities, dim=0)
+            print(f"Soft component mass: {soft_counts.detach().cpu().numpy()}")
         
         if return_details:
             return assignments, {
                 'responsibilities': responsibilities,
-                'log_likelihood': log_likelihood_new
+                'log_likelihood': log_likelihood_new,
+                'hard_counts': hard_counts
             }
 
-        return assignments
+        if compute_hard_assignments:
+            return assignments
+        return responsibilities
     
     def predict(self, pixels):
         """
@@ -376,14 +389,14 @@ class PixelGaussianMixture(nn.Module):
             alpha: 混合系数 (0.9表示90%保留历史)
         """
         if not self.initialized:
-            self.fit(new_pixels, max_iters=20)
+            self.fit(new_pixels, max_iters=20, compute_hard_assignments=False)
             return
         
-        # 1. 为新像素分配分量
-        assignments, _ = self.predict(new_pixels)
-        
-        # 2. 计算新统计量
-        new_stats = self.get_component_statistics(new_pixels, assignments)
+        # 1. 计算软分配责任矩阵
+        responsibilities, _ = self.e_step(new_pixels)
+
+        # 2. 基于软分配计算新统计量
+        new_stats = self.get_soft_component_statistics(new_pixels, responsibilities)
 
         # 1. 计算当前批次的总样本数 (所有簇的计数之和)
         # 注意: new_stats['counts'] 是一个 tensor 或 array，包含每个簇在这个 batch 里的像素数
@@ -426,7 +439,7 @@ class PixelGaussianMixture(nn.Module):
             log_likelihood: 当前批次 E 步对数似然
         """
         if not self.initialized:
-            _, details = self.fit(new_pixels, max_iters=20, return_details=True)
+            _, details = self.fit(new_pixels, max_iters=20, return_details=True, compute_hard_assignments=False)
             return details['log_likelihood']
 
         responsibilities, log_likelihood = self.e_step(new_pixels)
@@ -440,10 +453,30 @@ class PixelGaussianMixture(nn.Module):
         self.last_log_likelihood = log_likelihood
         return log_likelihood
 
-    def get_bic(self, pixels, max_iters=None):
-        """计算当前数据上的 BIC（会重新拟合一次）。"""
-        _, details = self.fit(pixels, max_iters=max_iters, return_details=True)
-        log_l = details['log_likelihood']
+    def get_bic(self, pixels, max_iters=None): # 15
+        """计算当前数据上的 BIC（内部会临时拟合，但不会污染当前模型状态）。"""
         n_samples = pixels.shape[0]
-        m = (self.num_components - 1) + self.num_components * self.feature_dim * 2
+
+        if n_samples <= 1:
+            raise ValueError("BIC requires at least 2 samples.")
+
+        _, details = self.fit(
+            pixels,
+            max_iters=max_iters,
+            return_details=True,
+            compute_hard_assignments=False
+        )
+        log_l = details['log_likelihood']
+
+        # m的计算根据协方差类型自适应
+        if self.covariance_type == 'diag':
+            # 对角协方差：(K-1) + K*D (均值) + K*D (方差)
+            m = (self.num_components - 1) + self.num_components * self.feature_dim * 2
+        elif self.covariance_type == 'full':
+            # 全协方差：(K-1) + K*D (均值) + K * [D(D+1)/2] (协方差矩阵)
+            cov_params = self.feature_dim * (self.feature_dim + 1) / 2
+            m = (self.num_components - 1) + self.num_components * (self.feature_dim + cov_params)
+        else:
+            raise ValueError(f"Unsupported covariance_type for BIC: {self.covariance_type}")
+
         return m * np.log(n_samples) - 2.0 * log_l

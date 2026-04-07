@@ -189,19 +189,3 @@ $$
 
 
 
-## 代码实现
-
-### 第一步：移植你的核心算法文件
-
-将你仓库中的核心算法文件直接复制到官方 `mixstyle-release` 仓库的 `imcls/`（图像分类）或 `reid/`（行人重识别）目录下。通常建议先在 `imcls` （如 PACS、OfficeHome 数据集）上做验证。
-
-你需要拷贝的文件：
-
-- `pixel_gmm.py` (包含 GMM 核心逻辑与 BIC 计算)
-- 将 `domain_adapter.py` 和 `style_transfer.py` 整合或者精简为一个 `gmmstyle.py` 文件（见第二步）。
-
-------
-
-### 第二步：编写兼容 MixStyle 的 `GMMStyle` 包装类
-
-在 `mixstyle-release` 的代码中（例如 `imcls/models/` 或新建），创建一个 `gmmstyle.py`。这个模块必须继承 `nn.Module`，并接管你的 GMM 更新和迁移逻辑。

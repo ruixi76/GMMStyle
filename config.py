@@ -54,7 +54,7 @@ class Config:
                                help='Batch size')
         self.parser.add_argument('--num_workers', type=int, default=4, 
                                help='Number of workers for data loading')
-        self.parser.add_argument('--epochs', type=int, default=10, 
+        self.parser.add_argument('--epochs', type=int, default=15, 
                                help='Number of training epochs')
         self.parser.add_argument('--lr', type=float, default=0.001, 
                                help='Learning rate')
@@ -71,12 +71,22 @@ class Config:
                        help='Weight for pixel-level style loss')
         self.parser.add_argument('--lambda_feature', type=float, default=1.0,
                        help='Weight for feature-level style loss')
+        # store_true 表示“布尔开关参数”。默认值是 False（你不写 --auto_select_k 时）。
+        # 只要命令行里写了 --auto_select_k，它就会变成 True。
         self.parser.add_argument('--auto_select_k', action='store_true',
                        help='Automatically select K via BIC before training')
+        # 含义：候选的高斯分量数 K 列表。
+        # 例如 3,5,7 表示会分别训练 K=3、K=5、K=7 的 GMM，然后比较它们的 BIC。
+        # 作用：决定“要比较哪些 K”。
         self.parser.add_argument('--bic_k_candidates', type=str, default='3,5,7',
                        help='Comma-separated candidate K values for BIC selection')
+        # 含义：做 BIC 评估时，从目标域训练集取多少个 batch 作为采样数据。
+        # 默认是 1，表示只用 1 个目标域 batch 的像素做离线 BIC。
+        # 作用：控制“BIC 用多少数据来估计”。
         self.parser.add_argument('--bic_num_batches', type=int, default=1,
                        help='Number of target batches to use for BIC warmup')
+        # 含义：每个候选 K 在计算 BIC 时，EM 迭代跑多少步。
+        # 作用：控制“每个候选模型拟合到什么程度”。
         self.parser.add_argument('--bic_em_iters', type=int, default=15,
                        help='EM iterations for each BIC candidate')
         

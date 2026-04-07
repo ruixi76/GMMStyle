@@ -27,9 +27,9 @@ class GMMStyleDomainAdapter:
 
         self.conf_threshold = 0.95  # 置信度阈值，建议 0.95
         self.lambda_target = 0.1    # 目标域损失的权重
-        self.style_mode = getattr(config, 'style_mode', 'both')
-        self.lambda_pixel = getattr(config, 'lambda_pixel', config.lambda_div)
-        self.lambda_feature = getattr(config, 'lambda_feature', 1.0)
+        self.style_mode = getattr(config, 'style_mode', 'both') # 风格迁移模式
+        self.lambda_pixel = getattr(config, 'lambda_pixel', config.lambda_div) # 像素级风格损失权重 lambda_div 默认为1.0
+        self.lambda_feature = getattr(config, 'lambda_feature', 1.0) # 特征级风格损失权重
         
         # 移动模型到设备
         self.model = self.model.to(self.device)
@@ -89,8 +89,8 @@ class GMMStyleDomainAdapter:
         """按单个 epoch 内的 batch 进度线性调度 alpha。"""
         start_alpha = getattr(self.config, 'style_alpha_start', self.config.style_alpha)
         end_alpha = getattr(self.config, 'style_alpha_end', self.config.style_alpha)
-        ratio = float(batch_idx + 1) / float(max(1, total_batches))
-        ratio = min(max(ratio, 0.0), 1.0)
+        ratio = float(batch_idx + 1) / float(max(1, total_batches)) # batch_idx 从 0 开始，所以加 1；total_batches 是总批次数，确保不除以零。
+        ratio = min(max(ratio, 0.0), 1.0) # 确保 ratio 在 [0,1] 范围内
         return start_alpha + (end_alpha - start_alpha) * ratio
     
     def _compute_source_statistics(self, source_images, responsibilities):
@@ -111,8 +111,11 @@ class GMMStyleDomainAdapter:
         """用冻结目标 GMM 对目标批次做 E 步，得到软分配统计量。"""
         B, C, H, W = target_images.shape
         target_pixels = target_images.permute(0, 2, 3, 1).reshape(-1, C)
-        _, target_probs = self.target_gmm.predict(target_images)  # [B, H, W, K]
+        _, target_probs = self.target_gmm.predict(target_images)  # [B, H, W, K]，得到的是E步的软分配概率
         target_responsibilities = target_probs.reshape(-1, self.config.num_gaussians)
+         # 其中和 m 步的计算"diag"型协方差矩阵的方法一样，为什么不直接用EM算法的 M 步来计算呢？因为我们在训练过程中是在线更新 GMM 的参数的，
+         # 所以每个批次的目标域数据都会有一个新的软分配统计量，这个统计量是根据当前 GMM 参数对当前批次数据做 E 步得到的。
+         # 我们需要这个统计量来进行风格迁移，而不是直接用 EM 算法的 M 步计算出来的参数，因为 M 步计算出来的是全局的 GMM 参数，而我们需要的是针对当前批次数据的统计量，这样才能更准确地进行风格迁移。
         target_stats = self.target_gmm.get_soft_component_statistics(target_pixels, target_responsibilities)
 
         return target_stats
@@ -180,7 +183,8 @@ class GMMStyleDomainAdapter:
         
         # 从 enumerate(source_loader) 中取出一个元组，结构是：(batch_idx, batch_data)。
         for batch_idx, (source_images, labels, _, _) in pbar:
-            style_alpha = self._current_style_alpha(batch_idx, total_batches)
+            # 计算当前 batch 的 alpha（风格迁移强度），根据 epoch 内的 batch 进度线性调度。
+            style_alpha = self._current_style_alpha(batch_idx, total_batches) # 计算当前 batch 的 alpha
             source_images = source_images.to(self.device)
             labels = labels.to(self.device)
             B, C, H, W = source_images.shape
@@ -203,7 +207,7 @@ class GMMStyleDomainAdapter:
                 # 首批次进行较充分的 warmup EM
                 self.target_gmm.fit(
                     target_pixels,
-                    max_iters=getattr(self.config, 'gmm_init_iters', 20),
+                    max_iters=getattr(self.config, 'gmm_init_iters', 20), # gmm_init_iters:20
                     return_details=True
                 )
 
