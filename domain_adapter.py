@@ -27,10 +27,32 @@ class GMMStyleDomainAdapter:
 
         self.conf_threshold = 0.95  # 置信度阈值，建议 0.95
         self.lambda_target = 0.1    # 目标域损失的权重
-        self.style_mode = getattr(config, 'style_mode', 'both') # 风格迁移模式
+        self.style_mode = getattr(config, 'style_mode', 'pixel') # 风格迁移模式
         self.lambda_pixel = getattr(config, 'lambda_pixel', config.lambda_div) # 像素级风格损失权重 lambda_div 默认为1.0
         self.lambda_feature = getattr(config, 'lambda_feature', 1.0) # 特征级风格损失权重
         
+        # 🎯 特征级专属配置（根据实际 ResNet 结构修改维度）
+        self.feature_style_layers = getattr(config, 'feature_style_layers', ['layer1', 'layer2'])
+        # ResNet18/34: layer1=64, layer2=128 | ResNet50/101: layer1=256, layer2=512
+        self.layer_dims = getattr(config, 'layer_dims', {'layer1': 256, 'layer2': 512})
+        
+        self.target_gmms = nn.ModuleDict()
+        self.gmm_state = {}
+        for layer in self.feature_style_layers:
+            self.target_gmms[layer] = PixelGaussianMixture(
+                num_components=config.num_gaussians,
+                feature_dim=self.layer_dims[layer],
+                covariance_type='full',          # 特征级必须用满秩协方差
+                device=config.device,
+                max_iters=config.gmm_max_iters,
+                tol=config.gmm_convergence_threshold
+            )
+            self.gmm_state[layer] = {
+                'initialized': False,
+                'target_stats': None,
+                'source_stats': None
+            }
+
         # 🆕 新增：全局 Batch 计数器（用于动态 Alpha 的倒余弦调度）
         self.global_step = 0
 
@@ -69,6 +91,7 @@ class GMMStyleDomainAdapter:
             eps=1e-6,
             alpha=config.style_alpha # 从配置读取 0.5
         ).to(self.device)
+        # 特征级风格迁移模块（支持多组件 WCT + 软分配加权）
         self.feature_style_transfer = FeatureStyleTransfer(
             num_components=config.num_gaussians,
             eps=1e-5
@@ -172,7 +195,7 @@ class GMMStyleDomainAdapter:
         Returns:
             data_2d: [N, D] 的展平矩阵，N = B×H×W（或特征图的空间乘积）
         """
-        if self.style_level == 'pixel':
+        if self.style_mode == 'pixel':
             # 像素级：直接展平空间维度，保留通道
             return images.permute(0, 2, 3, 1).reshape(-1, images.shape[1])
         else:
@@ -264,6 +287,10 @@ class GMMStyleDomainAdapter:
             
             # 3. 🎯 直接获取最终 GMM 参数（零计算开销）
             self.target_stats = self.target_gmm.get_target_parameters()
+
+            # ✅ 【关键修复】从对角协方差中提取标准差 σ = sqrt(diag(Σ))
+            cov_t = self.target_stats['covariances']
+            self.target_stats['stds'] = torch.sqrt(torch.diagonal(cov_t, dim1=1, dim2=2).clamp(min=1e-6))
         
             # ── 4. 源域责任矩阵计算 (使用当前最新的目标域 GMM) ──
             source_resp, _ = self.target_gmm.e_step(source_lab)  # [N, K]
@@ -286,19 +313,30 @@ class GMMStyleDomainAdapter:
                 source_means, source_covs, source_weights = self.target_gmm.m_step(
                     source_lab, source_resp, update_params=False
                 )   
+
+                # ✅ 【关键修复】提取源域标准差
+                source_stds = torch.sqrt(torch.diagonal(source_covs, dim1=1, dim2=2).clamp(min=1e-6))
+                
                 source_stats = {
                     'means': source_means,
                     'covariances': source_covs,
-                    'weights': source_weights
+                    'weights': source_weights,
+                    'stds': source_stds  # ✅ 补全 style_transfer 期望的键
                 }
+
+                B, C, H, W = source_lab_4d.shape
+                K = self.config.num_gaussians
+                source_resp_4d = source_resp.reshape(B, H, W, K)
+
                 # 4. 风格迁移（直接传入计算好的统计量）
                 styled_lab = self.style_transfer(
                     source_lab_4d,
-                    source_resp,
+                    source_resp_4d,
                     source_stats,
                     self.target_stats,
                     alpha=style_alpha
                 )
+
                 # ── 6. 🎨 CIELAB -> RGB (恢复原始空间供分类网络使用) ──
                 styled_images = self._lab_to_rgb(styled_lab)
                 styled_inputs = self.normalize(styled_images)
