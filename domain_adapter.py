@@ -31,6 +31,9 @@ class GMMStyleDomainAdapter:
         self.lambda_pixel = getattr(config, 'lambda_pixel', config.lambda_div) # 像素级风格损失权重 lambda_div 默认为1.0
         self.lambda_feature = getattr(config, 'lambda_feature', 1.0) # 特征级风格损失权重
         
+        # 🆕 新增：全局 Batch 计数器（用于动态 Alpha 的倒余弦调度）
+        self.global_step = 0
+
         # 移动模型到设备
         self.model = self.model.to(self.device)
         
@@ -85,13 +88,22 @@ class GMMStyleDomainAdapter:
             std=[0.229, 0.224, 0.225]
         )
 
-    def _current_style_alpha(self, batch_idx, total_batches):
-        """按单个 epoch 内的 batch 进度线性调度 alpha。"""
-        start_alpha = getattr(self.config, 'style_alpha_start', self.config.style_alpha)
-        end_alpha = getattr(self.config, 'style_alpha_end', self.config.style_alpha)
-        ratio = float(batch_idx + 1) / float(max(1, total_batches)) # batch_idx 从 0 开始，所以加 1；total_batches 是总批次数，确保不除以零。
-        ratio = min(max(ratio, 0.0), 1.0) # 确保 ratio 在 [0,1] 范围内
-        return start_alpha + (end_alpha - start_alpha) * ratio
+    def _current_style_alpha(self, global_step, warmup_batches):
+        """
+        Warm-up & Plateau 策略：平移缩放后的倒余弦曲线
+        t <= T_warmup:  S型平滑过渡 (初期慢 -> 中期快 -> 后期平缓触顶)
+        t > T_warmup:   锁定为 end_alpha (平台期，让网络在纯正目标域风格下充分训练)
+        """
+        start_alpha = getattr(self.config, 'style_alpha_start', 0.3)
+        end_alpha   = getattr(self.config, 'style_alpha_end', 0.8)
+        
+        if global_step >= warmup_batches:
+            return end_alpha  # ✅ 进入平台期，保持高强度风格注入
+            
+        import math
+        t_ratio = global_step / warmup_batches
+        # α(t) = α_start + 0.5*(α_end - α_start) * (1 - cos(π * t/T))
+        return start_alpha + 0.5 * (end_alpha - start_alpha) * (1 - math.cos(t_ratio * math.pi))
     
     def _compute_source_statistics(self, source_images, responsibilities):
         """
@@ -152,6 +164,23 @@ class GMMStyleDomainAdapter:
             'counts': counts,
         }
 
+    def _prepare_data(self, images):
+        """
+        统一数据预处理：将 4D 图像/特征张量展平为 GMM 要求的 2D 矩阵 [N, D]
+        Args:
+            images: [B, C, H, W] 的输入张量（源域或目标域通用）
+        Returns:
+            data_2d: [N, D] 的展平矩阵，N = B×H×W（或特征图的空间乘积）
+        """
+        if self.style_level == 'pixel':
+            # 像素级：直接展平空间维度，保留通道
+            return images.permute(0, 2, 3, 1).reshape(-1, images.shape[1])
+        else:
+            # 特征级：通过 Backbone 提取特征后展平
+            with torch.no_grad():
+                feats = self.backbone(images)
+                return feats.permute(0, 2, 3, 1).reshape(-1, feats.shape[1])
+
     def _compute_target_feature_statistics(self, target_images, target_probs):
         with torch.no_grad():
             target_inputs = self.normalize(target_images)
@@ -163,13 +192,8 @@ class GMMStyleDomainAdapter:
         """
         训练一个epoch
         """
-        # if not self.initialized:
-        #     raise RuntimeError("GMM not initialized. Call initialize_with_target_domain first.")
-        
         self.model.train() # 设置为训练模式
-        total_loss = 0.0
-        total_correct = 0
-        total_samples = 0
+        total_loss, total_correct, total_samples = 0.0, 0, 0
         
         # 目标域迭代器 (用于定期更新GMM)
         target_iter = iter(target_loader) # target_train_loader没有标签
@@ -183,11 +207,7 @@ class GMMStyleDomainAdapter:
         
         # 从 enumerate(source_loader) 中取出一个元组，结构是：(batch_idx, batch_data)。
         for batch_idx, (source_images, labels, _, _) in pbar:
-            # 计算当前 batch 的 alpha（风格迁移强度），根据 epoch 内的 batch 进度线性调度。
-            style_alpha = self._current_style_alpha(batch_idx, total_batches) # 计算当前 batch 的 alpha
-            source_images = source_images.to(self.device)
-            labels = labels.to(self.device)
-            B, C, H, W = source_images.shape
+            source_images, labels = source_images.to(self.device), labels.to(self.device)
 
             try:
                 # 获取一个 batch 的目标域数据
@@ -196,38 +216,60 @@ class GMMStyleDomainAdapter:
                 # 如果遍历完了，重新开始
                 target_iter = iter(target_loader)
                 target_images, _, _, _ = next(target_iter)
-
             target_images = target_images.to(self.device)
 
+            # ── 1. 🎨 RGB -> CIELAB (确保通道独立，完美适配 diag 协方差) ──
+            source_lab = self._rgb_to_lab(source_images)
+            target_lab = self._rgb_to_lab(target_images)
+
+            # ── 1. 统一数据展平 [B,C,H,W] -> [N,D] ──
+            source_lab = self._prepare_data(source_lab) # [N, 3] Lab空间像素
+            target_lab = self._prepare_data(target_lab)
+
+            # ── 2. 🎯 动态 Alpha 调度 (课程学习核心) ──
+            # 随着 batch 推进，GMM 逐渐稳定，alpha 线性增加
+            # 早期小 alpha 保护语义结构，后期大 alpha 充分注入目标域风格
+            style_alpha = self._current_style_alpha(self.global_step, total_batches)
+
             if not self.target_gmm.initialized:
-                print("\n[Train] Lazy initializing GMM with the first target batch...")
-                # 将图像展平为像素 B,C,H,W->B,H,W,C->B*H*W,C
-                target_pixels = target_images.permute(0, 2, 3, 1).reshape(-1, 3)
-
-                # 首批次进行较充分的 warmup EM
-                self.target_gmm.fit(
-                    target_pixels,
-                    max_iters=getattr(self.config, 'gmm_init_iters', 20), # gmm_init_iters:20
-                    return_details=True
-                )
-
-                self.target_stats = self._compute_target_statistics(target_images)
-                _, target_probs = self.target_gmm.predict(target_images)
-                self.target_feature_stats = self._compute_target_feature_statistics(target_images, target_probs)
+                # 【Batch 0】首次初始化：完整 EM 拟合，建立目标域分布先验
+                print("\n[Train] Warmup EM on first target batch...")
+                self.target_gmm.fit(target_lab, max_iters=getattr(self.config, 'gmm_init_iters', 20))
                 self.initialized = True
+                self.target_gmm.initialized = True  # 同步内部标志
                 print("[Train] GMM initialized successfully.")
 
-            # 1. 像素级分配到GMM分量
-            # assignments 是一个维度为[B,H,W]的张量，表示每个像素被分配到的分量索引（从 0 到 num_components-1）。
-            _, source_probs = self.target_gmm.predict(source_images)  # [B, H, W, K]
+                # 特征级统计量按需初始化
+                if self.style_mode in ('feature', 'both'):
+                    _, target_probs = self.target_gmm.predict(target_images)
+                    self.target_feature_stats = self._compute_target_feature_statistics(target_images, target_probs)
+            else:
+                # 【Batch ≥ 1】在线 EMA 更新：逐步追踪目标域分布漂移
+                # E步：获取当前目标批次的责任矩阵
+                resp_t, _ = self.target_gmm.e_step(target_lab)
+                # M步：仅计算新参数，绝不覆盖 self.*
+                new_means, new_covs, new_weights = self.target_gmm.m_step(target_lab, resp_t, update_params=False)
+                
+                # EMA 平滑融合 (tau=0.99 保证历史分布占主导，抗单批次噪声)
+                tau = getattr(self.config, 'gmm_ema_tau', 0.99)
+                self.target_gmm.update_with_ema(target_lab, resp_t, tau)
+                
+                # 特征级统计量按需更新 (可选：此处简化为重算，实际也可加 EMA)
+                if self.style_mode in ('feature', 'both') and hasattr(self, 'target_feature_stats'):
+                    _, target_probs = self.target_gmm.predict(target_images)
+                    self.target_feature_stats = self._compute_target_feature_statistics(target_images, target_probs)
             
-            # 清空上一个 Batch 残留的梯度（像计算器归零）。
+            # 3. 🎯 直接获取最终 GMM 参数（零计算开销）
+            self.target_stats = self.target_gmm.get_target_parameters()
+        
+            # ── 4. 源域责任矩阵计算 (使用当前最新的目标域 GMM) ──
+            source_resp, _ = self.target_gmm.e_step(source_lab)  # [N, K]
+
+            # ── 5. 梯度清空 ──
             self.optimizer.zero_grad()
 
+            # ── 6. 原始源域分类损失 ──
             source_inputs = self.normalize(source_images)
-            target_inputs = self.normalize(target_images)
-
-            # 原始源域图像
             source_features = self.model.extract_features(source_inputs)
             logits_src = self.model.classify_features(source_features)
             loss_src = self.criterion(logits_src, labels)
@@ -235,21 +277,33 @@ class GMMStyleDomainAdapter:
             loss_pixel = torch.tensor(0.0, device=self.device)
             loss_feature = torch.tensor(0.0, device=self.device)
 
+            # ── 7. 风格迁移损失 (像素级 / 特征级) ──
             if self.style_mode in ('pixel', 'both'):
-                source_stats = self._compute_source_statistics(source_images, source_probs)
-                styled_images = self.style_transfer(
+                # 源域成分级统计量 (M步计算，update_params=False 绝不污染目标域GMM)
+                source_means, source_covs, source_weights = self.target_gmm.m_step(
+                    source_lab, source_resp, update_params=False
+                )   
+                source_stats = {
+                    'means': source_means,
+                    'covariances': source_covs,
+                    'weights': source_weights
+                }
+                # 4. 风格迁移（直接传入计算好的统计量）
+                styled_lab = self.style_transfer(
                     source_images,
-                    source_probs,
+                    source_resp,
                     source_stats,
                     self.target_stats,
                     alpha=style_alpha
                 )
+                # ── 6. 🎨 CIELAB -> RGB (恢复原始空间供分类网络使用) ──
+                styled_images = self._lab_to_rgb(styled_lab)
                 styled_inputs = self.normalize(styled_images)
                 logits_pixel, _ = self.model(styled_inputs)
                 loss_pixel = self.criterion(logits_pixel, labels)
 
             if self.style_mode in ('feature', 'both') and self.target_feature_stats is not None:
-                source_img_resp = self._compute_image_level_responsibilities(source_probs)
+                source_img_resp = self._compute_image_level_responsibilities(source_resp)
                 source_feature_stats = self._compute_soft_feature_statistics(
                     source_features.detach(),
                     source_img_resp.detach()
@@ -263,42 +317,39 @@ class GMMStyleDomainAdapter:
                 logits_feature = self.model.classify_features(stylized_features)
                 loss_feature = self.criterion(logits_feature, labels)
             
-            # 目标域伪标签训练 (Pseudo-Labeling)
+            # ── 8. 目标域伪标签损失 ──
+            target_inputs = self.normalize(target_images)
             # 1. 计算目标域 logits
             logits_tgt, _ = self.model(target_inputs)
-            
             # 2. 计算概率
             probs_tgt = torch.softmax(logits_tgt, dim=1)
-            
             # 3. 获取最大概率和对应的预测类别
             max_probs, tgt_preds = torch.max(probs_tgt, dim=1)
-            
             # 4. 生成掩码：只选择置信度 > 0.95 的样本
             mask = max_probs.ge(self.conf_threshold).float()
-            
             # 5. 计算损失 (只计算高置信度样本)
             # reduction='none' 是为了保留每个样本的损失，以便乘以 mask
             # loss_target_raw = nn.CrossEntropyLoss(reduction='none')(logits_target, target_preds)
             # loss_target = (loss_target_raw * mask).mean()
             loss_tgt = (nn.CrossEntropyLoss(reduction='none')(logits_tgt, tgt_preds) * mask).mean()
 
+            # ── 9. 总损失合成 ──
             loss = loss_src + self.lambda_target * loss_tgt
             if self.style_mode in ('pixel', 'both'):
-                loss = loss + self.lambda_pixel * loss_pixel
+                loss += self.lambda_pixel * loss_pixel 
             if self.style_mode in ('feature', 'both'):
-                loss = loss + self.lambda_feature * loss_feature
+                loss += self.lambda_feature * loss_feature
 
-            # 5. 反向传播
+            # ── 10. 反向传播 & 优化 ──
             loss.backward()
             self.optimizer.step()
             
-            # 6. 统计
+            # ── 11. 统计 & 进度条 ──
             total_loss += loss.item()
             _, predicted = torch.max(logits_src.data, 1)
             total_correct += (predicted == labels).sum().item()
             total_samples += labels.size(0)
             
-            # 7. 更新进度条
             pbar.set_postfix({
                 'Loss': f"{total_loss/(batch_idx+1):.4f}",
                 'Acc': f"{100.*total_correct/total_samples:.2f}%",
@@ -306,72 +357,8 @@ class GMMStyleDomainAdapter:
                 'Lp': f"{loss_pixel.item():.3f}",
                 'Lf': f"{loss_feature.item():.3f}"
             })
-            
-            # 8. 定期更新GMM (每100个批次)
-            if (batch_idx + 1) % self.config.gmm_update_freq == 0:
-                target_pixels = target_images.permute(0, 2, 3, 1).reshape(-1, 3)
-                self.target_gmm.online_em_update(target_pixels, tau=self.config.gmm_ema_tau)
-                self.target_stats = self._compute_target_statistics(target_images)
-                _, target_probs = self.target_gmm.predict(target_images)
-                self.target_feature_stats = self._compute_target_feature_statistics(target_images, target_probs)
 
-        return total_loss / len(source_loader), 0.0 # 返回 acc
-    
-    # 以下是你在跑 MixStyle baseline 时，替代原先 train_epoch 的逻辑片段
-
-    def train_epoch_mixstyle(self, source_loader, target_loader, epoch):
-        self.model.train()
-        target_iter = iter(target_loader)
-        
-        # 训练进度
-        pbar = tqdm(enumerate(source_loader), total=len(source_loader), desc=f'Epoch {epoch+1}')
-
-        for batch_idx, (source_images, labels, _, _) in enumerate(source_loader):
-            source_images = source_images.to(self.device)
-            labels = labels.to(self.device)
-            
-            try:
-                target_images, _, _, _ = next(target_iter)
-            except StopIteration:
-                target_iter = iter(target_loader)
-                target_images, _, _, _ = next(target_iter)
-            target_images = target_images.to(self.device)
-
-            # 加上 ImageNet 标准化 (因为没有你的像素级操作，直接正常输入即可)
-            source_images = self.normalize(source_images)
-            target_images = self.normalize(target_images)
-
-            # 核心：将 Source 和 Target 拼接在一起，送入含有 MixStyle 的网络
-            # 这样网络内部的 MixStyle 就能把 Source 和 Target 的底层特征统计量进行混合
-            combined_images = torch.cat([source_images, target_images], dim=0)
-            
-            self.optimizer.zero_grad()
-            
-            # 前向传播 (此时 MixStyle 会在特征层自动发生)
-            logits_combined, _ = self.model(combined_images)
-            
-            # 拆分预测结果
-            batch_src = source_images.size(0)
-            logits_src = logits_combined[:batch_src]
-            logits_tgt = logits_combined[batch_src:]
-            
-            # 1. 源域分类损失
-            loss_src = self.criterion(logits_src, labels)
-            
-            # 2. 目标域伪标签损失 (为了与你的方法公平对比，保留你的伪标签学习策略)
-            probs_tgt = torch.softmax(logits_tgt, dim=1)
-            max_probs, tgt_preds = torch.max(probs_tgt, dim=1)
-            mask = max_probs.ge(self.conf_threshold).float()
-            loss_tgt = (nn.CrossEntropyLoss(reduction='none')(logits_tgt, tgt_preds) * mask).mean()
-            
-            # 只需要这两个损失即可，没有 loss_style 了
-            loss = loss_src + self.lambda_target * loss_tgt
-            
-            loss.backward()
-            self.optimizer.step()
-
-            # 7. 更新进度条
-
+        return total_loss / len(source_loader), 100. * total_correct / total_samples
     
     def validate(self, loader, domain_name='target'):
         """
@@ -466,3 +453,62 @@ class GMMStyleDomainAdapter:
         if is_best:
             best_filename = os.path.join(self.config.checkpoint_dir, 'best_model.pth')
             torch.save(state, best_filename)
+
+    def _rgb_to_lab(self, rgb):
+        """RGB [B,3,H,W] (0~1) -> CIELAB [B,3,H,W]"""
+        if rgb.max() > 1.0: rgb = rgb / 255.0  # 兼容 0-255 输入
+        
+        # 1. sRGB -> Linear RGB
+        mask = rgb > 0.04045
+        linear = torch.where(mask, ((rgb + 0.055) / 1.055) ** 2.4, rgb / 12.92)
+        
+        # 2. Linear RGB -> XYZ (D65)
+        M = torch.tensor([
+            [0.4124564, 0.3575761, 0.1804375],
+            [0.2126729, 0.7151522, 0.0721750],
+            [0.0193339, 0.1191920, 0.9503041]
+        ], device=rgb.device, dtype=rgb.dtype)
+        
+        B, C, H, W = rgb.shape
+        rgb_flat = rgb.permute(0, 2, 3, 1).reshape(-1, 3)
+        xyz = torch.matmul(rgb_flat, M.T).reshape(B, H, W, 3).permute(0, 3, 1, 2)
+        
+        # 3. XYZ -> CIELAB
+        ref = torch.tensor([0.95047, 1.00000, 1.08883], device=rgb.device, dtype=rgb.dtype)
+        xyz_norm = xyz / ref.view(1, 3, 1, 1)
+        f = torch.where(xyz_norm > 0.008856, xyz_norm ** (1/3), (903.3 * xyz_norm + 16) / 116)
+        
+        L = 116 * f[:, 0:1, :, :] - 16
+        a = 500 * (f[:, 0:1, :, :] - f[:, 1:2, :, :])
+        b = 200 * (f[:, 1:2, :, :] - f[:, 2:3, :, :])
+        return torch.cat([L, a, b], dim=1)
+
+    def _lab_to_rgb(self, lab):
+        """CIELAB [B,3,H,W] -> RGB [B,3,H,W] (0~1)"""
+        L, a, b = lab[:, 0:1, :, :], lab[:, 1:2, :, :], lab[:, 2:3, :, :]
+        f_y = (L + 16) / 116
+        f_x = a / 500 + f_y
+        f_z = f_y - b / 200
+        
+        delta = 6/29
+        f_inv = torch.where(f_x > delta, f_x**3, 3*delta**2*(f_x - 4/29))
+        f_inv = torch.cat([f_inv, torch.where(f_y > delta, f_y**3, 3*delta**2*(f_y - 4/29)), 
+                           torch.where(f_z > delta, f_z**3, 3*delta**2*(f_z - 4/29))], dim=1)
+        
+        ref = torch.tensor([0.95047, 1.00000, 1.08883], device=lab.device, dtype=lab.dtype)
+        xyz = f_inv * ref.view(1, 3, 1, 1)
+        
+        M_inv = torch.tensor([
+            [ 3.2404542, -1.5371385, -0.4985314],
+            [-0.9692660,  1.8760108,  0.0415560],
+            [ 0.0556434, -0.2040259,  1.0572252]
+        ], device=lab.device, dtype=lab.dtype)
+        
+        B, C, H, W = lab.shape
+        xyz_flat = xyz.permute(0, 2, 3, 1).reshape(-1, 3)
+        rgb_linear = torch.matmul(xyz_flat, M_inv.T).reshape(B, H, W, 3).permute(0, 3, 1, 2)
+        
+        # Linear RGB -> sRGB
+        mask = rgb_linear > 0.0031308
+        rgb = torch.where(mask, 1.055 * (rgb_linear ** (1/2.4)) - 0.055, 12.92 * rgb_linear)
+        return torch.clamp(rgb, 0.0, 1.0)

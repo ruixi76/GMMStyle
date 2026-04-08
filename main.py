@@ -93,7 +93,7 @@ def main():
     # 单目标域适配任务中，auto_select_k 我们是采取一个批次的数据来进行 BIC 评估的，但若是多目标域适配任务中，
     # 可能会有多个目标域，每个目标域都需要评估一次，所以我们就不限制只取一个批次了，而是每个目标域取一个批次的数据来进行评估。
     if getattr(config, 'auto_select_k', False): # auto_select_k为action='store_true
-        auto_select_num_gaussians(config, target_train_loader)
+        auto_select_num_gaussians(config, target_train_loader) # config.num_gaussians = best_k更改配置信息
     
     # 3. 创建模型
     print("\nCreating model...")

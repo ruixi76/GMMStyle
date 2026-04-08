@@ -11,7 +11,7 @@ class PixelStyleTransfer(nn.Module):
         super().__init__()
         self.num_components = num_components
         self.eps = eps # 避免分母为零
-        self.alpha = alpha  # 保存为成员变量
+        self.alpha = alpha  # 保存为成员变量 0.5
     
     def forward(self, source_images, responsibilities,
                 source_stats, target_stats, alpha=None):
@@ -53,7 +53,7 @@ class PixelStyleTransfer(nn.Module):
 
         # 软分配融合: x_style = Σ_k γ_nk * x_hat_nk
         gamma = responsibilities.unsqueeze(-1)  # [B, H, W, K, 1]
-        styled_nhwc = torch.sum(gamma * candidates, dim=3)
+        styled_nhwc = torch.sum(gamma * candidates, dim=3) # [B, H, W, C]
 
         # 内容保留混合: x_final = alpha*x_style + (1-alpha)*x_source
         styled_nhwc = alpha * styled_nhwc + (1.0 - alpha) * source_nhwc

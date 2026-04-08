@@ -172,12 +172,24 @@ class PixelGaussianMixture(nn.Module):
         # 使用 .item() 后打印输出会是干净的 12.3456，而不是带有张量标记的 tensor(12.3456, device='cuda:0')
         return responsibilities, log_likelihood.item() 
     
-    def m_step(self, pixels, responsibilities):
+    def m_step(self, pixels, responsibilities, update_params=True):
         """
-        M步: 基于责任矩阵更新GMM参数
+        M步: 基于责任矩阵计算新的GMM参数
+        
+        【核心设计】: 
+        - 默认不直接更新 self.means/covariances/weights
+        - 通过 update_params 参数控制是否更新内部状态
+        - 返回新参数供外部使用（如风格迁移时的统计量提取）
+        
         Args:
             pixels: 像素数据 [N, C]
             responsibilities: 责任矩阵 [N, k]
+            update_params: 是否更新模型内部参数 (默认True保持fit兼容性)
+        
+        Returns:
+            new_means: [k, C] 新均值
+            new_covariances: [k, C, C] 或 [k, C](diag) 新协方差
+            new_weights: [k] 新混合权重
         """
         N = pixels.shape[0]
         new_means = torch.zeros_like(self.means)
@@ -202,34 +214,35 @@ class PixelGaussianMixture(nn.Module):
                 weighted_var = torch.sum(resp_k.unsqueeze(1) * (diff ** 2), dim=0) / Nk
                 new_covariances[k] = torch.diag(weighted_var.clamp(min=1e-4))
             else:
-                # 完整协方差矩阵
-                weighted_outer = torch.zeros(self.feature_dim, self.feature_dim, device=self.device)
-                for i in range(min(N, 1000)):  # 限制计算量
-                    if resp_k[i] > 1e-8:
-                        # torch.outer 的含义是“外积”。它接收两个一维向量，返回一个二维矩阵，矩阵中第 i 行第 j 列元素等于这两个向量对应元素相乘。
-                        outer = torch.outer(diff[i], diff[i])
-                        weighted_outer += resp_k[i] * outer
-                new_covariances[k] = weighted_outer / Nk + 1e-6 * torch.eye(self.feature_dim, device=self.device)
+                # 完整协方差: 向量化计算替代循环 (修复原代码截断问题)
+                resp_k_clamped = torch.clamp(resp_k, min=0)  # 确保权重非负
+                diff_weighted = diff * resp_k_clamped.unsqueeze(1)  # [N, C]
+                cov_k = (diff_weighted.T @ diff) / Nk  # [C, C]
+                new_covariances[k] = cov_k + 1e-6 * torch.eye(self.feature_dim, device=self.device)
             
             # 更新权重: π_k = Σ_n γ_k(x_n) / N
             new_weights[k] = Nk / N
-        
-        # 更新参数
-        self.means = new_means.detach()
-        self.covariances = new_covariances.detach()
-        self.weights = new_weights.detach()
+            
+        # 【关键】: 仅当 update_params=True 时才更新内部状态
+        if update_params:
+            self.means = new_means.detach()
+            self.covariances = new_covariances.detach()
+            self.weights = new_weights.detach()
 
         return new_means, new_covariances, new_weights
     
     def fit(self, pixels, max_iters=None, return_details=False, compute_hard_assignments=False):
         """
         使用EM算法拟合GMM
+
         Args:
             pixels: 像素数据 [N, C]
-            max_iters: 最大迭代次数 (覆盖初始化时的设置)
+            max_iters: 最大迭代次数 (覆盖初始化设置)
+            return_details: 是否返回责任矩阵等详细信息
+            compute_hard_assignments: 是否计算硬分配(argmax)
+        
         Returns:
-            responsibilities 或 assignments (取决于 compute_hard_assignments)
-            details (optional): 包含 responsibilities 和 log_likelihood
+            assignments/responsibilities + 可选的details
         """
         # 初始化gmm参数（如果还没有初始化的话）
         self._initialize_parameters(pixels)
@@ -237,17 +250,17 @@ class PixelGaussianMixture(nn.Module):
         # Python 里 or 的返回规则是：左边为真，返回左边；左边为假，返回右边
         # 若max_iters参数为None，则使用self.max_iters的值（即初始化时设置的默认值）。如果 max_iters 参数被显式传入了一个整数值，那么就使用这个值。
         max_iters = max_iters or self.max_iters 
+        log_likelihood_old = float('-inf')
         
         print(f"[PixelGMM] Running EM algorithm for {max_iters} iterations...")
 
         pbar = tqdm(range(max_iters), desc='EM Iterations')
-        log_likelihood_new = log_likelihood_old
         for i in pbar:
-            # E步
+            # ── E步: 计算责任矩阵 ──
             responsibilities, log_likelihood_new = self.e_step(pixels)
             
-            # M步：根据E步计算的责任矩阵更新GMM参数（均值，协方差，权重）
-            self.m_step(pixels, responsibilities)
+            # ── M步: 计算并更新参数 (fit模式下update_params=True) ──
+            self.m_step(pixels, responsibilities, update_params=True)
             
             # 检查收敛
             if i > 0 and abs(log_likelihood_new - log_likelihood_old) < self.tol:
@@ -255,10 +268,15 @@ class PixelGaussianMixture(nn.Module):
                 break
             log_likelihood_old = log_likelihood_new
 
+        # ✅ 【关键新增】: 缓存最后一次迭代的责任矩阵
+        # 后续计算 target_stats 时可直接使用，避免重复 E 步
+        self._cached_responsibilities = responsibilities.detach()
+        self._cached_pixels_shape = pixels.shape  # 用于形状校验
+
         self.last_log_likelihood = log_likelihood_new
         print(f"[PixelGMM] EM completed. Final log-likelihood: {log_likelihood_new:.4f}")
+
         assignments = None
-        hard_counts = None
         if compute_hard_assignments:
             # 仅在显式需要硬分配时才执行 argmax
             # 最终分配: 每个像素分配到概率最高的分量
@@ -281,13 +299,29 @@ class PixelGaussianMixture(nn.Module):
                 'hard_counts': hard_counts
             }
 
-        if compute_hard_assignments:
-            return assignments
-        return responsibilities
+        return assignments if compute_hard_assignments else responsibilities
     
+    def get_target_parameters(self):
+        """
+        【核心接口】直接返回当前 GMM 的最终参数（拟合后或更新后）
+        无需任何额外计算，直接读取 self.* 即可
+        """
+        if not self.initialized:
+            raise RuntimeError("GMM not initialized. Call fit() first.")
+            
+        return {
+            'means': self.means,          # [K, D]
+            'covariances': self.covariances, # [K, D, D] 或 [K, D]
+            'weights': self.weights       # [K]
+        }
+
     def predict(self, pixels):
         """
-        预测像素的分量分配
+        预测像素的分量分配（推理模式: 使用冻结参数，不修改模型状态）
+
+        【设计目的】: 
+        - 源域风格迁移时，用目标域冻结的GMM计算责任矩阵
+        - 确保源域统计量计算不污染目标域分布
         Args:
             pixels: 像素数据 [N, C] 或 [B, C, H, W]
         Returns:
@@ -453,6 +487,14 @@ class PixelGaussianMixture(nn.Module):
         self.last_log_likelihood = log_likelihood
         return log_likelihood
 
+    def update_with_ema(self, pixels, responsibilities, tau=0.99):
+        """一步完成：计算新参数 + EMA平滑更新（推荐用于在线学习）"""
+        new_means, new_covs, new_weights = self.m_step(pixels, responsibilities, update_params=False)
+        self.means = tau * self.means + (1 - tau) * new_means
+        self.covariances = tau * self.covariances + (1 - tau) * new_covs
+        self.weights = tau * self.weights + (1 - tau) * new_weights
+        return self.get_target_parameters()
+
     def get_bic(self, pixels, max_iters=None): # 15
         """计算当前数据上的 BIC（内部会临时拟合，但不会污染当前模型状态）。"""
         n_samples = pixels.shape[0]
@@ -460,6 +502,7 @@ class PixelGaussianMixture(nn.Module):
         if n_samples <= 1:
             raise ValueError("BIC requires at least 2 samples.")
 
+        # ── 临时拟合计算似然 ──
         _, details = self.fit(
             pixels,
             max_iters=max_iters,
@@ -468,15 +511,14 @@ class PixelGaussianMixture(nn.Module):
         )
         log_l = details['log_likelihood']
 
-        # m的计算根据协方差类型自适应
+        # ── 计算自由参数数量 m ──
         if self.covariance_type == 'diag':
-            # 对角协方差：(K-1) + K*D (均值) + K*D (方差)
-            m = (self.num_components - 1) + self.num_components * self.feature_dim * 2
-        elif self.covariance_type == 'full':
-            # 全协方差：(K-1) + K*D (均值) + K * [D(D+1)/2] (协方差矩阵)
-            cov_params = self.feature_dim * (self.feature_dim + 1) / 2
-            m = (self.num_components - 1) + self.num_components * (self.feature_dim + cov_params)
+            cov_params = self.feature_dim  # 对角协方差: D个方差
         else:
-            raise ValueError(f"Unsupported covariance_type for BIC: {self.covariance_type}")
+            cov_params = self.feature_dim * (self.feature_dim + 1) // 2  # 全协方差: D(D+1)/2
+        
+        # m = (K-1)权重 + K×(D均值 + 协方差参数)
+        m = (self.num_components - 1) + self.num_components * (self.feature_dim + cov_params)
 
+        # ── 计算BIC ──
         return m * np.log(n_samples) - 2.0 * log_l

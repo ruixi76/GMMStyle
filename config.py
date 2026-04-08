@@ -43,7 +43,7 @@ class Config:
                        help='Warmup EM iterations for first target batch')
         self.parser.add_argument('--momentum', type=float, default=0.9, 
                                help='Momentum for incremental GMM updates')
-        self.parser.add_argument('--gmm_ema_tau', type=float, default=0.9,
+        self.parser.add_argument('--gmm_ema_tau', type=float, default=0.99,
                        help='EMA factor for online EM updates (larger means more history)')
         self.parser.add_argument('--covariance_type', type=str, default='diag', 
                                choices=['diag', 'full'],
