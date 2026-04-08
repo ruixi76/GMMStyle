@@ -207,6 +207,7 @@ class GMMStyleDomainAdapter:
         
         # 从 enumerate(source_loader) 中取出一个元组，结构是：(batch_idx, batch_data)。
         for batch_idx, (source_images, labels, _, _) in pbar:
+            self.global_step += 1
             source_images, labels = source_images.to(self.device), labels.to(self.device)
 
             try:
@@ -219,12 +220,12 @@ class GMMStyleDomainAdapter:
             target_images = target_images.to(self.device)
 
             # ── 1. 🎨 RGB -> CIELAB (确保通道独立，完美适配 diag 协方差) ──
-            source_lab = self._rgb_to_lab(source_images)
-            target_lab = self._rgb_to_lab(target_images)
+            source_lab_4d = self._rgb_to_lab(source_images)
+            target_lab_4d = self._rgb_to_lab(target_images)
 
             # ── 1. 统一数据展平 [B,C,H,W] -> [N,D] ──
-            source_lab = self._prepare_data(source_lab) # [N, 3] Lab空间像素
-            target_lab = self._prepare_data(target_lab)
+            source_lab = self._prepare_data(source_lab_4d) # [N, 3] Lab空间像素
+            target_lab = self._prepare_data(target_lab_4d)
 
             # ── 2. 🎯 动态 Alpha 调度 (课程学习核心) ──
             # 随着 batch 推进，GMM 逐渐稳定，alpha 线性增加
@@ -252,7 +253,9 @@ class GMMStyleDomainAdapter:
                 
                 # EMA 平滑融合 (tau=0.99 保证历史分布占主导，抗单批次噪声)
                 tau = getattr(self.config, 'gmm_ema_tau', 0.99)
-                self.target_gmm.update_with_ema(target_lab, resp_t, tau)
+                self.target_gmm.means       = tau * self.target_gmm.means       + (1 - tau) * new_means
+                self.target_gmm.covariances = tau * self.target_gmm.covariances + (1 - tau) * new_covs
+                self.target_gmm.weights     = tau * self.target_gmm.weights     + (1 - tau) * new_weights
                 
                 # 特征级统计量按需更新 (可选：此处简化为重算，实际也可加 EMA)
                 if self.style_mode in ('feature', 'both') and hasattr(self, 'target_feature_stats'):
@@ -290,7 +293,7 @@ class GMMStyleDomainAdapter:
                 }
                 # 4. 风格迁移（直接传入计算好的统计量）
                 styled_lab = self.style_transfer(
-                    source_images,
+                    source_lab_4d,
                     source_resp,
                     source_stats,
                     self.target_stats,
@@ -331,7 +334,8 @@ class GMMStyleDomainAdapter:
             # reduction='none' 是为了保留每个样本的损失，以便乘以 mask
             # loss_target_raw = nn.CrossEntropyLoss(reduction='none')(logits_target, target_preds)
             # loss_target = (loss_target_raw * mask).mean()
-            loss_tgt = (nn.CrossEntropyLoss(reduction='none')(logits_tgt, tgt_preds) * mask).mean()
+            loss_tgt_raw = nn.CrossEntropyLoss(reduction='none')(logits_tgt, tgt_preds)
+            loss_tgt = (loss_tgt_raw * mask).sum() / (mask.sum() + 1e-8)
 
             # ── 9. 总损失合成 ──
             loss = loss_src + self.lambda_target * loss_tgt
