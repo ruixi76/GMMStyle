@@ -247,6 +247,9 @@ class PixelGaussianMixture(nn.Module):
         # 初始化gmm参数（如果还没有初始化的话）
         self._initialize_parameters(pixels)
         
+        assignments = None
+        hard_counts = None  # ✅ 关键修复：提前初始化为 None
+        
         # Python 里 or 的返回规则是：左边为真，返回左边；左边为假，返回右边
         # 若max_iters参数为None，则使用self.max_iters的值（即初始化时设置的默认值）。如果 max_iters 参数被显式传入了一个整数值，那么就使用这个值。
         max_iters = max_iters or self.max_iters 
