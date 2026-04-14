@@ -4,13 +4,6 @@ import os
 class Config:
     def __init__(self):
         self.parser = argparse.ArgumentParser(description='Pixel-level GMM Domain Adaptation')
-        
-        self.dataset = 'pacs' # 新增数据集标识
-        self.num_classes = 7  # PACS 有 7 个类别 (Dog, Elephant, Giraffe, Guitar, Horse, House, Person)
-        
-        # 将 source_domain 改为列表
-        self.source_domains = ['art_painting', 'cartoon', 'sketch'] 
-        self.target_domain = 'photo'
 
         # 数据集配置
         self.parser.add_argument('--source_domain', type=str, default='amazon', 
@@ -64,13 +57,10 @@ class Config:
                                help='Weight decay')
         self.parser.add_argument('--lambda_div', type=float, default=1.0, 
                                help='Weight for diversity loss (style transferred images)')
-        self.parser.add_argument('--style_mode', type=str, default='both',
-                       choices=['pixel', 'feature', 'both'],
-                       help='Style transfer mode: pixel, feature, or both')
+        self.parser.add_argument('--style_mode', type=str, default='pixel',
+                                 help='Style transfer mode: pixel, feature, or both')
         self.parser.add_argument('--lambda_pixel', type=float, default=1.0,
                        help='Weight for pixel-level style loss')
-        self.parser.add_argument('--lambda_feature', type=float, default=1.0,
-                       help='Weight for feature-level style loss')
         # store_true 表示“布尔开关参数”。默认值是 False（你不写 --auto_select_k 时）。
         # 只要命令行里写了 --auto_select_k，它就会变成 True。
         self.parser.add_argument('--auto_select_k', action='store_true',
@@ -86,9 +76,9 @@ class Config:
         self.parser.add_argument('--bic_num_batches', type=int, default=1,
                        help='Number of target batches to use for BIC warmup')
         # 含义：每个候选 K 在计算 BIC 时，EM 迭代跑多少步。
-        # 作用：控制“每个候选模型拟合到什么程度”。
-        self.parser.add_argument('--bic_em_iters', type=int, default=15,
-                       help='EM iterations for each BIC candidate')
+        # # 作用：控制“每个候选模型拟合到什么程度”。
+        # self.parser.add_argument('--bic_em_iters', type=int, default=15,
+        #                help='EM iterations for each BIC candidate')
         
         # 其他配置
         self.parser.add_argument('--seed', type=int, default=42, 

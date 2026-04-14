@@ -4,9 +4,8 @@ from torchvision import models
 from mixstyle import MixStyle # 引入 MixStyle
 
 class FeatureExtractor(nn.Module):
-    def __init__(self, backbone='resnet50', pretrained=True, use_mixstyle=False):
+    def __init__(self, backbone='resnet50', pretrained=True):
         super().__init__()
-        self.use_mixstyle = use_mixstyle
 
         if backbone == 'resnet50':
             resnet = models.resnet50(pretrained=pretrained)
@@ -25,11 +24,6 @@ class FeatureExtractor(nn.Module):
         self.layer3 = resnet.layer3
         self.layer4 = resnet.layer4
         self.avgpool = resnet.avgpool
-
-        # 插入 MixStyle 层
-        if self.use_mixstyle:
-            self.mixstyle1 = MixStyle(p=0.5, alpha=0.1, mix='crossdomain')
-            self.mixstyle2 = MixStyle(p=0.5, alpha=0.1, mix='crossdomain')
     
     def forward(self, x):
         x = self.conv1(x)
@@ -38,13 +32,7 @@ class FeatureExtractor(nn.Module):
         x = self.maxpool(x)
         
         x = self.layer1(x)
-        if self.use_mixstyle:
-            x = self.mixstyle1(x) # 混合一次风格
-            
         x = self.layer2(x)
-        if self.use_mixstyle:
-            x = self.mixstyle2(x) # 再混合一次风格
-            
         x = self.layer3(x)
         x = self.layer4(x)
         
@@ -67,8 +55,7 @@ class DomainAdapter(nn.Module):
         super().__init__()
         self.feature_extractor = FeatureExtractor(
             backbone=config.backbone,
-            pretrained=True,
-            use_mixstyle=use_mixstyle # 传入标志位
+            pretrained=True
         )
         self.classifier = Classifier(
             feature_dim=self.feature_extractor.feature_dim,

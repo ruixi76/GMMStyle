@@ -62,10 +62,10 @@ def auto_select_num_gaussians(config, target_loader):
             feature_dim=3,
             device=config.device,
             covariance_type=config.covariance_type, # 'diag'
-            max_iters=config.bic_em_iters, # 15
+            max_iters=config.gmm_init_iters, # 15
             tol=config.gmm_convergence_threshold, # 1e-3
         )
-        bic = gmm.get_bic(target_pixels, max_iters=config.bic_em_iters)
+        bic = gmm.get_bic(target_pixels, max_iters=config.gmm_init_iters)
         print(f"[BIC] K={k}, BIC={bic:.2f}")
         if bic < best_bic:
             best_bic = bic
