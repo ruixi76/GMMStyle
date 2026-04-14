@@ -5,7 +5,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from pixel_gmm import PixelGaussianMixture
-from style_transfer import PixelStyleTransfer, FeatureStyleTransfer
+from style_transfer import PixelStyleTransfer
 # 导入 transform
 from torchvision import transforms
 
