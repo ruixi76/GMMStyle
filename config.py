@@ -30,9 +30,7 @@ class Config:
                                help='Frequency of GMM update (in batches)')
         self.parser.add_argument('--gmm_convergence_threshold', type=float, default=1e-3, 
                                help='Convergence threshold for EM algorithm')
-        self.parser.add_argument('--gmm_max_iters', type=int, default=50, 
-                               help='Maximum iterations for EM algorithm')
-        self.parser.add_argument('--gmm_init_iters', type=int, default=20,
+        self.parser.add_argument('--gmm_iters', type=int, default=20,
                        help='Warmup EM iterations for first target batch')
         self.parser.add_argument('--momentum', type=float, default=0.9, 
                                help='Momentum for incremental GMM updates')

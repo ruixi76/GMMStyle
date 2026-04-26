@@ -53,8 +53,9 @@ def auto_select_num_gaussians(config, target_loader):
     # config.bic_k_candidates：3，5，7
     print(f"\n[BIC] Evaluating K candidates: {config.bic_k_candidates}") 
     # config.num_gaussians：5 
-    best_k = config.num_gaussians # 初始化为默认值，万一 BIC 评估出问题了，就至少有个合理的 K 不会崩溃。
+    # best_k = config.num_gaussians # 初始化为默认值，万一 BIC 评估出问题了，就至少有个合理的 K 不会崩溃。
     best_bic = float('inf') # BIC 越小越好，所以初始值设为正无穷。
+    best_gmm = None  # 🆕 直接保存实例引用
 
     for k in config.bic_k_candidates:
         gmm = PixelGaussianMixture(
@@ -62,17 +63,17 @@ def auto_select_num_gaussians(config, target_loader):
             feature_dim=3,
             device=config.device,
             covariance_type=config.covariance_type, # 'diag'
-            max_iters=config.gmm_init_iters, # 15
+            fit_iters=config.gmm_iters, 
             tol=config.gmm_convergence_threshold, # 1e-3
         )
-        bic = gmm.get_bic(target_pixels, max_iters=config.gmm_init_iters)
+        bic = gmm.get_bic(target_pixels, fit_iters=config.gmm_iters)
         print(f"[BIC] K={k}, BIC={bic:.2f}")
         if bic < best_bic:
             best_bic = bic
-            best_k = k
+            best_gmm = gmm 
 
-    config.num_gaussians = best_k
-    print(f"[BIC] Selected K={best_k} (min BIC={best_bic:.2f})")
+    print(f"[BIC] Optimal K={best_gmm.num_components}, BIC={best_bic:.2f}")
+    return best_gmm
 
 def main():
     # 1. 解析配置
@@ -87,13 +88,15 @@ def main():
     print("\nLoading datasets...")
     source_train_loader, source_val_loader, target_train_loader, target_test_loader = get_dataloaders(config)
 
+    target_gmm = None
+    
     # getattr(config, 'auto_select_k', False) 是从 config 对象里取 auto_select_k 这个属性。
     # 如果这个属性存在，就返回它的值。
     # 如果不存在，就返回第三个参数里的默认值 False。
     # 单目标域适配任务中，auto_select_k 我们是采取一个批次的数据来进行 BIC 评估的，但若是多目标域适配任务中，
     # 可能会有多个目标域，每个目标域都需要评估一次，所以我们就不限制只取一个批次了，而是每个目标域取一个批次的数据来进行评估。
-    if getattr(config, 'auto_select_k', False): # auto_select_k为action='store_true
-        auto_select_num_gaussians(config, target_train_loader) # config.num_gaussians = best_k更改配置信息
+    if getattr(config, 'auto_select_k', False): # auto_select_k为action='store_true'
+        target_gmm = auto_select_num_gaussians(config, target_train_loader) # config.num_gaussians = best_k更改配置信息
     
     # 3. 创建模型
     print("\nCreating model...")
@@ -101,7 +104,7 @@ def main():
     
     # 4. 创建训练器
     print("Creating domain adapter...")
-    trainer = GMMStyleDomainAdapter(model, config)
+    trainer = GMMStyleDomainAdapter(model, config, target_gmm)
     
     # 5. 训练模型
     print("\nStarting training...")

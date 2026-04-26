@@ -6,6 +6,8 @@ import seaborn as sns
 from torchvision.utils import make_grid
 from PIL import Image
 
+from pixel_gmm import PixelGaussianMixture
+
 def visualize_gmm_components(gmm, num_samples=5, save_path='gmm_components.png'):
     """
     可视化GMM组件的像素分布
@@ -389,3 +391,34 @@ def visualize_pixel_assignments(assignments, image=None, save_path='pixel_assign
     plt.savefig(save_path, dpi=200, bbox_inches='tight')
     plt.close()
     print(f"Pixel assignments visualization saved to {save_path}")
+
+# utils/bic_selector.py
+def select_k_via_bic(pixels, k_candidates, config):
+    """离线评估候选K，返回已拟合的最优GMM实例"""
+    best_bic = float('inf')
+    best_gmm = None  # 🆕 直接保存实例引用
+
+    for k in k_candidates:
+        # 创建候选实例
+        gmm = PixelGaussianMixture(
+            num_components=k,
+            feature_dim=3,  # LAB空间
+            device=config.device,
+            covariance_type='diag',
+            max_iters=config.gmm_init_iters
+        )
+        
+        # 🔹 执行拟合（内部完成 KMeans初始化 + EM迭代，并设置 initialized=True）
+        log_likelihood = gmm.fit(pixels, return_details=False)
+        
+        # 🔹 计算 BIC（仅读取已拟合参数，不修改状态）
+        n_samples = pixels.shape[0]
+        m = (k - 1) + 2 * k * 3  # 对角协方差下的自由参数数
+        bic = m * np.log(n_samples) - 2.0 * log_likelihood
+        
+        if bic < best_bic:
+            best_bic = bic
+            best_gmm = gmm  # 🆕 Python引用传递，零拷贝开销
+
+    print(f"[BIC] Optimal K={best_gmm.num_components}, BIC={best_bic:.2f}")
+    return best_gmm

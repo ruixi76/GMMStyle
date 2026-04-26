@@ -20,7 +20,7 @@ class GMMStyleDomainAdapter:
        c. 用风格迁移后的图像增强训练
        d. 定期用新目标域数据更新GMM
     """
-    def __init__(self, model, config):
+    def __init__(self, model, config, target_gmm=None):
         self.model = model
         self.config = config
         self.device = torch.device(config.device)
@@ -49,22 +49,26 @@ class GMMStyleDomainAdapter:
             gamma=0.1
         )
         
+        if target_gmm is None:
+                # 默认先构建一个目标域 GMM（未初始化，由训练首批触发 fit）
+            target_gmm = PixelGaussianMixture(
+                num_components=config.num_gaussians,
+                feature_dim=3,
+                device=config.device,
+                covariance_type=config.covariance_type,
+                fit_iters=config.gmm_iters,
+                tol=config.gmm_convergence_threshold,
+            )
+
         # 损失函数
         self.criterion = nn.CrossEntropyLoss()
         
         # GMM模型 (目标域)
-        self.target_gmm = PixelGaussianMixture(
-            num_components=config.num_gaussians,
-            feature_dim=3,  # RGB
-            device=config.device,
-            covariance_type='diag',  # 推荐使用对角协方差
-            max_iters=config.gmm_max_iters, # 50
-            tol=config.gmm_convergence_threshold # 1e-3
-        )
+        self.target_gmm = target_gmm
         
         # 风格迁移模块
         self.style_transfer = PixelStyleTransfer(
-            num_components=config.num_gaussians,
+            num_components=self.target_gmm.num_components,
             eps=1e-6,
             alpha=config.style_alpha # 从配置读取 0.5
         ).to(self.device)
@@ -73,7 +77,6 @@ class GMMStyleDomainAdapter:
         self.target_stats = None
         
         # 训练状态
-        self.initialized = False
         self.best_accuracy = 0.0
         
         # 1. 定义 ImageNet 标准化
@@ -161,21 +164,8 @@ class GMMStyleDomainAdapter:
             if not self.target_gmm.initialized:
                 # 【Batch 0】首次初始化：完整 EM 拟合，建立目标域分布先验
                 print("\n[Train] Warmup EM on first target batch...")
-                self.target_gmm.fit(target_lab, max_iters=getattr(self.config, 'gmm_init_iters', 20))
-                self.target_gmm.initialized = True  # 同步内部标志
+                self.target_gmm.fit(target_lab, fit_iters=getattr(self.config, 'gmm_iters', 20))
                 print("[Train] GMM initialized successfully.")
-            else:
-                # 【Batch ≥ 1】在线 EMA 更新：逐步追踪目标域分布漂移
-                # E步：获取当前目标批次的责任矩阵
-                resp_t, _ = self.target_gmm.e_step(target_lab)
-                # M步：仅计算新参数，绝不覆盖 self.*
-                new_means, new_covs, new_weights = self.target_gmm.m_step(target_lab, resp_t, update_params=False)
-                
-                # EMA 平滑融合 (tau=0.99 保证历史分布占主导，抗单批次噪声)
-                tau = getattr(self.config, 'gmm_ema_tau', 0.99)
-                self.target_gmm.means       = tau * self.target_gmm.means       + (1 - tau) * new_means
-                self.target_gmm.covariances = tau * self.target_gmm.covariances + (1 - tau) * new_covs
-                self.target_gmm.weights     = tau * self.target_gmm.weights     + (1 - tau) * new_weights
             
             # 3. 🎯 直接获取最终 GMM 参数（零计算开销）
             self.target_stats = self.target_gmm.get_target_parameters()
@@ -201,7 +191,7 @@ class GMMStyleDomainAdapter:
             }
 
             B, C, H, W = source_lab_4d.shape
-            K = self.config.num_gaussians
+            K = self.target_gmm.num_components
             source_resp_4d = source_resp.reshape(B, H, W, K)
 
             # 4. 风格迁移（直接传入计算好的统计量）
@@ -266,6 +256,18 @@ class GMMStyleDomainAdapter:
                 'a': f"{style_alpha:.2f}",
                 'Lp': f"{loss_pixel.item():.3f}"
             })
+
+            # 【Batch ≥ 1】在线 EMA 更新：逐步追踪目标域分布漂移
+            # E步：获取当前目标批次的责任矩阵
+            resp_t, _ = self.target_gmm.e_step(target_lab)
+            # M步：仅计算新参数，绝不覆盖 self.*
+            new_means, new_covs, new_weights = self.target_gmm.m_step(target_lab, resp_t, update_params=False)
+            
+            # EMA 平滑融合 (tau=0.99 保证历史分布占主导，抗单批次噪声)
+            tau = getattr(self.config, 'gmm_ema_tau', 0.99)
+            self.target_gmm.means       = tau * self.target_gmm.means       + (1 - tau) * new_means
+            self.target_gmm.covariances = tau * self.target_gmm.covariances + (1 - tau) * new_covs
+            self.target_gmm.weights     = tau * self.target_gmm.weights     + (1 - tau) * new_weights
 
         return total_loss / len(source_loader), 100. * total_correct / total_samples
     

@@ -12,14 +12,14 @@ class PixelGaussianMixture(nn.Module):
     理论基础: p(x) = Σ_k π_k * N(x|μ_k, Σ_k)
     """
     def __init__(self, num_components=5, feature_dim=3, device='cuda:0', 
-                 covariance_type='diag', max_iters=100, tol=1e-4):
+                 covariance_type='diag', fit_iters=50, tol=1e-4):
         """
         Args:
             num_components: 高斯分量数量k
             feature_dim: 特征维度 (RGB图像为3)
             device: 计算设备
             covariance_type: 'full' (完整协方差) 或 'diag' (对角协方差，推荐)
-            max_iters: EM算法最大迭代次数
+            fit_iters: EM算法最大迭代次数
             tol: 收敛阈值
         """
         super().__init__()
@@ -27,7 +27,7 @@ class PixelGaussianMixture(nn.Module):
         self.feature_dim = feature_dim
         self.device = torch.device(device)
         self.covariance_type = covariance_type
-        self.max_iters = max_iters # 50
+        self.fit_iters = fit_iters # 50
         self.tol = tol # 收敛阈值
         
         # GMM参数 (全部在GPU上)
@@ -231,13 +231,13 @@ class PixelGaussianMixture(nn.Module):
 
         return new_means, new_covariances, new_weights
     
-    def fit(self, pixels, max_iters=None, return_details=False, compute_hard_assignments=False):
+    def fit(self, pixels, fit_iters=None, return_details=False, compute_hard_assignments=False):
         """
         使用EM算法拟合GMM
 
         Args:
             pixels: 像素数据 [N, C]
-            max_iters: 最大迭代次数 (覆盖初始化设置)
+            fit_iters: 模型拟合迭代次数 (覆盖初始化设置)
             return_details: 是否返回责任矩阵等详细信息
             compute_hard_assignments: 是否计算硬分配(argmax)
         
@@ -251,13 +251,13 @@ class PixelGaussianMixture(nn.Module):
         hard_counts = None  # ✅ 关键修复：提前初始化为 None
         
         # Python 里 or 的返回规则是：左边为真，返回左边；左边为假，返回右边
-        # 若max_iters参数为None，则使用self.max_iters的值（即初始化时设置的默认值）。如果 max_iters 参数被显式传入了一个整数值，那么就使用这个值。
-        max_iters = max_iters or self.max_iters 
+        # 若fit_iters参数为None，则使用self.fit_iters的值（即初始化时设置的默认值）。如果 fit_iters 参数被显式传入了一个整数值，那么就使用这个值。
+        fit_iters = fit_iters or self.fit_iters 
         log_likelihood_old = float('-inf')
         
-        print(f"[PixelGMM] Running EM algorithm for {max_iters} iterations...")
+        print(f"[PixelGMM] Running EM algorithm for {fit_iters} iterations...")
 
-        pbar = tqdm(range(max_iters), desc='EM Iterations')
+        pbar = tqdm(range(fit_iters), desc='EM Iterations')
         for i in pbar:
             # ── E步: 计算责任矩阵 ──
             responsibilities, log_likelihood_new = self.e_step(pixels)
@@ -318,7 +318,7 @@ class PixelGaussianMixture(nn.Module):
             'weights': self.weights       # [K]
         }
 
-    def get_bic(self, pixels, max_iters=None): # 15
+    def get_bic(self, pixels, fit_iters=None): # 15
         """计算当前数据上的 BIC（内部会临时拟合，但不会污染当前模型状态）。"""
         n_samples = pixels.shape[0]
 
@@ -328,7 +328,7 @@ class PixelGaussianMixture(nn.Module):
         # ── 临时拟合计算似然 ──
         _, details = self.fit(
             pixels,
-            max_iters=max_iters,
+            fit_iters=fit_iters,
             return_details=True,
             compute_hard_assignments=False
         )
