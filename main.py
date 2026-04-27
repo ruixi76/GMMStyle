@@ -7,6 +7,8 @@ from datasets import get_dataloaders
 from model import DomainAdapter
 from domain_adapter import GMMStyleDomainAdapter
 from pixel_gmm import PixelGaussianMixture
+from utils import rgb_to_lab
+import torch.nn.functional as F
 
 def set_seed(seed):
     """设置随机种子"""
@@ -29,17 +31,23 @@ def collect_target_pixels(target_loader, device, num_batches=1):
     - 一个形状为 [N, 3] 的张量，包含了 N 个像素的 RGB 值，用于 GMM 拟合和 BIC 评估
     """
     pixel_batches = []
+    down_scale = 4  # 必须与 domain_adapter.py 中的下采样尺度保持一致！
     for batch_idx, (images, _, _, _) in enumerate(target_loader):
         if batch_idx >= max(1, num_batches):
             break
         images = images.to(device)
-        pixels = images.permute(0, 2, 3, 1).reshape(-1, 3) # [B，C，H，W] -> [B，H，W，C] -> [B*H*W，C]
+        images_lab = rgb_to_lab(images)  # 转入 LAB 空间
+        
+        # 2. 空间网格下采样 (平均池化)
+        # 160万像素瞬间降至 10万像素，大幅提升 BIC 速度与统计学准确性
+        images_down = F.avg_pool2d(images_lab, kernel_size=down_scale, stride=down_scale)
+        
+        pixels = images_down.permute(0, 2, 3, 1).reshape(-1, 3) # [B，C，H，W] -> [B，H，W，C] -> [B*H*W，C]
         # append 是 Python 列表的“追加”操作。它会把当前这个 batch 的 pixels 张量，放到列表 pixel_batches 的末尾。
         pixel_batches.append(pixels)
     # torch.cat 是“拼接张量。pixel_batches 是一个列表，里面每个元素都是形状类似 [N_i, 3] 的张量。
     # dim=0 表示沿第 0 维（行方向）拼接。
     return torch.cat(pixel_batches, dim=0)
-
 
 def auto_select_num_gaussians(config, target_loader):
     device = torch.device(config.device)

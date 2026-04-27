@@ -61,6 +61,11 @@ class DomainAdapter(nn.Module):
             feature_dim=self.feature_extractor.feature_dim,
             num_classes=config.num_classes
         )
+        # 新增：类别平均置信度的 EMA，作为 buffer 挂到模型上
+        self.register_buffer(
+            'class_probs_ema',
+            torch.ones(config.num_classes, dtype=torch.float32) / config.num_classes
+        )
 
     @property
     def feature_dim(self):

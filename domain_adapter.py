@@ -2,12 +2,14 @@ import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from pixel_gmm import PixelGaussianMixture
 from style_transfer import PixelStyleTransfer
 # 导入 transform
 from torchvision import transforms
+from utils import rgb_to_lab, lab_to_rgb, soft_gamut_compress
 
 class GMMStyleDomainAdapter:
     """
@@ -59,6 +61,11 @@ class GMMStyleDomainAdapter:
                 fit_iters=config.gmm_iters,
                 tol=config.gmm_convergence_threshold,
             )
+
+        # === 【新增】：初始化类别平均置信度追踪器 ===
+        # 初始时，假设模型对每个类的预测概率是均匀分布的 (1 / num_classes)
+        # register_buffer 保证它能随模型 save/load，并且自动移动到正确的 device
+        # self.class_probs_ema = (torch.ones(config.num_classes) / config.num_classes).to(self.device)
 
         # 损失函数
         self.criterion = nn.CrossEntropyLoss()
@@ -149,23 +156,49 @@ class GMMStyleDomainAdapter:
             target_images = target_images.to(self.device)
 
             # ── 1. 🎨 RGB -> CIELAB (确保通道独立，完美适配 diag 协方差) ──
-            source_lab_4d = self._rgb_to_lab(source_images)
-            target_lab_4d = self._rgb_to_lab(target_images)
+            source_lab_4d = rgb_to_lab(source_images)
+            target_lab_4d = rgb_to_lab(target_images)
 
-            # ── 1. 统一数据展平 [B,C,H,W] -> [N,D] ──
-            source_lab = self._prepare_data(source_lab_4d) # [N, 3] Lab空间像素
-            target_lab = self._prepare_data(target_lab_4d)
+            # # ── 1. 统一数据展平 [B,C,H,W] -> [N,D] ──
+            # source_lab = self._prepare_data(source_lab_4d) # [N, 3] Lab空间像素
+            # target_lab = self._prepare_data(target_lab_4d)
+            B, C, H, W = source_lab_4d.shape
+            
+            # ========================================================
+            # 🚀 性能优化核心：空间网格下采样 (Scale factor = 4)
+            # ========================================================
+            down_scale = 4  # 将 224x224 缩小到 56x56
+            source_lab_down = F.avg_pool2d(source_lab_4d, kernel_size=down_scale, stride=down_scale)
+            target_lab_down = F.avg_pool2d(target_lab_4d, kernel_size=down_scale, stride=down_scale)
+            
+            # 将下采样后的 4D 张量展平为 2D，用于 GMM 统计
+            source_lab_down_flat = self._prepare_data(source_lab_down) 
+            target_lab_down_flat = self._prepare_data(target_lab_down)
 
             # ── 2. 🎯 动态 Alpha 调度 (课程学习核心) ──
             # 随着 batch 推进，GMM 逐渐稳定，alpha 线性增加
             # 早期小 alpha 保护语义结构，后期大 alpha 充分注入目标域风格
             style_alpha = self._current_style_alpha(self.global_step, total_batches)
-
-            if not self.target_gmm.initialized:
-                # 【Batch 0】首次初始化：完整 EM 拟合，建立目标域分布先验
-                print("\n[Train] Warmup EM on first target batch...")
-                self.target_gmm.fit(target_lab, fit_iters=getattr(self.config, 'gmm_iters', 20))
-                print("[Train] GMM initialized successfully.")
+            if epoch == 0:
+                if not self.target_gmm.initialized:
+                    # 【Batch 0】首次初始化：完整 EM 拟合，建立目标域分布先验
+                    print("\n[Train] Warmup EM on first target batch...")
+                    self.target_gmm.fit(target_lab_down_flat, fit_iters=getattr(self.config, 'gmm_iters', 20))
+                    print("[Train] GMM initialized successfully.")
+                else:
+                    # 【Batch ≥ 1】在线 EMA 更新：用第一周期的数据打磨 BIC 初始先验
+                    with torch.no_grad():
+                        # 【Batch ≥ 1】在线 EMA 更新：逐步追踪目标域分布漂移
+                        # E步：获取当前目标批次的责任矩阵
+                        resp_t, _ = self.target_gmm.e_step(target_lab_down_flat)
+                        # M步：仅计算新参数，绝不覆盖 self.*
+                        new_means, new_covs, new_weights = self.target_gmm.m_step(target_lab_down_flat, resp_t, update_params=False)
+                        
+                        # EMA 平滑融合 (tau=0.99 保证历史分布占主导，抗单批次噪声)
+                        tau = getattr(self.config, 'gmm_ema_tau', 0.99)
+                        self.target_gmm.means       = tau * self.target_gmm.means       + (1 - tau) * new_means
+                        self.target_gmm.covariances = tau * self.target_gmm.covariances + (1 - tau) * new_covs
+                        self.target_gmm.weights     = tau * self.target_gmm.weights     + (1 - tau) * new_weights
             
             # 3. 🎯 直接获取最终 GMM 参数（零计算开销）
             self.target_stats = self.target_gmm.get_target_parameters()
@@ -173,13 +206,13 @@ class GMMStyleDomainAdapter:
             # ✅ 【关键修复】从对角协方差中提取标准差 σ = sqrt(diag(Σ))
             cov_t = self.target_stats['covariances']
             self.target_stats['stds'] = torch.sqrt(torch.diagonal(cov_t, dim1=1, dim2=2).clamp(min=1e-6))
-        
+            
             # ── 4. 源域责任矩阵计算 (使用当前最新的目标域 GMM) ──
-            source_resp, _ = self.target_gmm.e_step(source_lab)  # [N, K]
+            source_resp_down_flat, _ = self.target_gmm.e_step(source_lab_down_flat)  # [N, K]
 
             # 源域成分级统计量 (M步计算，update_params=False 绝不污染目标域GMM)
             source_means, source_covs, source_weights = self.target_gmm.m_step(
-                source_lab, source_resp, update_params=False
+                source_lab_down_flat, source_resp_down_flat, update_params=False
             )
             source_stds = torch.sqrt(torch.diagonal(source_covs, dim1=1, dim2=2).clamp(min=1e-6))
             
@@ -192,7 +225,24 @@ class GMMStyleDomainAdapter:
 
             B, C, H, W = source_lab_4d.shape
             K = self.target_gmm.num_components
-            source_resp_4d = source_resp.reshape(B, H, W, K)
+
+            # ========================================================
+            # 🚀 双线性上采样：恢复全分辨率并附赠“平滑魔法”
+            # ========================================================
+            H_down, W_down = source_lab_down.shape[2], source_lab_down.shape[3]
+            
+            # 将展平的 gamma 变为 4D: [B, K, H/4, W/4]
+            source_resp_down_4d = source_resp_down_flat.view(B, H_down, W_down, K).permute(0, 3, 1, 2).contiguous()
+            
+            # 上采样回原始分辨率 [B, K, 224, 224] (这步极其关键，平滑就是在这里发生的！)
+            source_resp_full_4d = F.interpolate(source_resp_down_4d, size=(H, W), mode='bilinear', align_corners=False)
+            
+            # 重新归一化以防插值带来的微小数值误差 (保证概率和为 1)
+            source_resp_full_4d = torch.clamp(source_resp_full_4d, min=1e-6)
+            source_resp_full_4d = source_resp_full_4d / source_resp_full_4d.sum(dim=1, keepdim=True)
+            
+            # 转置回风格迁移需要的维度: [B, H, W, K]
+            source_resp_4d = source_resp_full_4d.permute(0, 2, 3, 1).contiguous()
 
             # 4. 风格迁移（直接传入计算好的统计量）
             styled_lab = self.style_transfer(
@@ -204,7 +254,23 @@ class GMMStyleDomainAdapter:
             )
 
             # ── 6. 🎨 CIELAB -> RGB (恢复原始空间供分类网络使用) ──
-            styled_images = self._lab_to_rgb(styled_lab)
+            styled_images = lab_to_rgb(styled_lab)
+
+            overflow_mask = (styled_images < 0.0) | (styled_images > 1.0)
+            overflow_rate = overflow_mask.float().mean().item()
+            raw_min = styled_images.amin().item()
+            raw_max = styled_images.amax().item()
+
+            if overflow_rate > 0.10:
+                styled_images = soft_gamut_compress(styled_images, delta=0.05)
+
+            post_min = styled_images.amin().item()
+            post_max = styled_images.amax().item()
+
+            if batch_idx % 20 == 0:
+                print(f"[RGB overflow] raw_rate={overflow_rate:.4f}, "
+                    f"raw_min={raw_min:.3f}, raw_max={raw_max:.3f}, "
+                    f"post_min={post_min:.3f}, post_max={post_max:.3f}")
 
             # ── 5. 梯度清空 ──
             self.optimizer.zero_grad()
@@ -228,8 +294,29 @@ class GMMStyleDomainAdapter:
             probs_tgt = torch.softmax(logits_tgt, dim=1)
             # 3. 获取最大概率和对应的预测类别
             max_probs, tgt_preds = torch.max(probs_tgt, dim=1)
+            with torch.no_grad():
+                # 1. 计算当前 Batch 内，模型对每个类别的平均预测概率 [C]
+                batch_class_probs = probs_tgt.mean(dim=0)
+                
+                # 2. EMA 更新全局类别置信度 (tau=0.99 保证平滑)
+                tau_ema = 0.99
+                # 假设追踪器存在于 self 中
+                self.model.class_probs_ema.mul_(tau_ema).add_((1 - tau_ema) * batch_class_probs)
+                
+                # 3. 计算动态缩放因子：以当前学得最好的类别的平均概率为天花板
+                max_ema = self.model.class_probs_ema.max()
+                
+                # 4. 动态计算每个类的独立阈值
+                # 易学类别阈值逼近 conf_threshold (0.95)，难学类别等比例下降
+                dynamic_thresholds = self.conf_threshold * (self.model.class_probs_ema / (max_ema + 1e-8))
+                
+                # 可选安全策略：给长尾类别设置一个最低门槛（例如0.5），防止完全乱猜的样本也被纳入
+                dynamic_thresholds = torch.clamp(dynamic_thresholds, min=0.5)
+
+            # 5. 获取当前 batch 中，每个样本预测类别所对应的独立阈值
+            sample_thresholds = dynamic_thresholds[tgt_preds]
             # 4. 生成掩码：只选择置信度 > 0.95 的样本
-            mask = max_probs.ge(self.conf_threshold).float()
+            mask = max_probs.ge(sample_thresholds).float()
             # 5. 计算损失 (只计算高置信度样本)
             # reduction='none' 是为了保留每个样本的损失，以便乘以 mask
             # loss_target_raw = nn.CrossEntropyLoss(reduction='none')(logits_target, target_preds)
@@ -256,18 +343,6 @@ class GMMStyleDomainAdapter:
                 'a': f"{style_alpha:.2f}",
                 'Lp': f"{loss_pixel.item():.3f}"
             })
-
-            # 【Batch ≥ 1】在线 EMA 更新：逐步追踪目标域分布漂移
-            # E步：获取当前目标批次的责任矩阵
-            resp_t, _ = self.target_gmm.e_step(target_lab)
-            # M步：仅计算新参数，绝不覆盖 self.*
-            new_means, new_covs, new_weights = self.target_gmm.m_step(target_lab, resp_t, update_params=False)
-            
-            # EMA 平滑融合 (tau=0.99 保证历史分布占主导，抗单批次噪声)
-            tau = getattr(self.config, 'gmm_ema_tau', 0.99)
-            self.target_gmm.means       = tau * self.target_gmm.means       + (1 - tau) * new_means
-            self.target_gmm.covariances = tau * self.target_gmm.covariances + (1 - tau) * new_covs
-            self.target_gmm.weights     = tau * self.target_gmm.weights     + (1 - tau) * new_weights
 
         return total_loss / len(source_loader), 100. * total_correct / total_samples
     
@@ -364,63 +439,3 @@ class GMMStyleDomainAdapter:
         if is_best:
             best_filename = os.path.join(self.config.checkpoint_dir, 'best_model.pth')
             torch.save(state, best_filename)
-
-    def _rgb_to_lab(self, rgb):
-        """RGB [B,3,H,W] (0~1) -> CIELAB [B,3,H,W]"""
-        if rgb.max() > 1.0: rgb = rgb / 255.0  # 兼容 0-255 输入
-        
-        # 1. sRGB -> Linear RGB
-        mask = rgb > 0.04045
-        linear = torch.where(mask, ((rgb + 0.055) / 1.055) ** 2.4, rgb / 12.92)
-        
-        # 2. Linear RGB -> XYZ (D65)
-        M = torch.tensor([
-            [0.4124564, 0.3575761, 0.1804375],
-            [0.2126729, 0.7151522, 0.0721750],
-            [0.0193339, 0.1191920, 0.9503041]
-        ], device=rgb.device, dtype=rgb.dtype)
-        
-        B, C, H, W = rgb.shape
-        rgb_flat = rgb.permute(0, 2, 3, 1).reshape(-1, 3)
-        xyz = torch.matmul(rgb_flat, M.T).reshape(B, H, W, 3).permute(0, 3, 1, 2)
-        
-        # 3. XYZ -> CIELAB
-        ref = torch.tensor([0.95047, 1.00000, 1.08883], device=rgb.device, dtype=rgb.dtype)
-        xyz_norm = xyz / ref.view(1, 3, 1, 1)
-        f = torch.where(xyz_norm > 0.008856, xyz_norm ** (1/3), (903.3 * xyz_norm + 16) / 116)
-        
-        L = 116 * f[:, 0:1, :, :] - 16
-        a = 500 * (f[:, 0:1, :, :] - f[:, 1:2, :, :])
-        b = 200 * (f[:, 1:2, :, :] - f[:, 2:3, :, :])
-        return torch.cat([L, a, b], dim=1)
-
-    def _lab_to_rgb(self, lab):
-        """CIELAB [B,3,H,W] -> RGB [B,3,H,W] (0~1)"""
-        L, a, b = lab[:, 0:1, :, :], lab[:, 1:2, :, :], lab[:, 2:3, :, :]
-        f_y = (L + 16) / 116
-        f_x = a / 500 + f_y
-        f_z = f_y - b / 200
-        
-        delta = 6/29
-        f_inv = torch.where(f_x > delta, f_x**3, 3*delta**2*(f_x - 4/29))
-        f_inv = torch.cat([f_inv, torch.where(f_y > delta, f_y**3, 3*delta**2*(f_y - 4/29)), 
-                           torch.where(f_z > delta, f_z**3, 3*delta**2*(f_z - 4/29))], dim=1)
-        
-        ref = torch.tensor([0.95047, 1.00000, 1.08883], device=lab.device, dtype=lab.dtype)
-        xyz = f_inv * ref.view(1, 3, 1, 1)
-        
-        M_inv = torch.tensor([
-            [ 3.2404542, -1.5371385, -0.4985314],
-            [-0.9692660,  1.8760108,  0.0415560],
-            [ 0.0556434, -0.2040259,  1.0572252]
-        ], device=lab.device, dtype=lab.dtype)
-        
-        B, C, H, W = lab.shape
-        xyz_flat = xyz.permute(0, 2, 3, 1).reshape(-1, 3)
-        rgb_linear = torch.matmul(xyz_flat, M_inv.T).reshape(B, H, W, 3).permute(0, 3, 1, 2)
-        
-        # Linear RGB -> sRGB
-        mask = rgb_linear > 0.0031308
-        rgb = torch.where(mask, 1.055 * (rgb_linear ** (1/2.4)) - 0.055, 12.92 * rgb_linear)
-        return torch.clamp(rgb, 0.0, 1.0)
-    

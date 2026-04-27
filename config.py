@@ -71,7 +71,7 @@ class Config:
         # 含义：做 BIC 评估时，从目标域训练集取多少个 batch 作为采样数据。
         # 默认是 1，表示只用 1 个目标域 batch 的像素做离线 BIC。
         # 作用：控制“BIC 用多少数据来估计”。
-        self.parser.add_argument('--bic_num_batches', type=int, default=1,
+        self.parser.add_argument('--bic_num_batches', type=int, default=20,
                        help='Number of target batches to use for BIC warmup')
         # 含义：每个候选 K 在计算 BIC 时，EM 迭代跑多少步。
         # # 作用：控制“每个候选模型拟合到什么程度”。

@@ -392,33 +392,85 @@ def visualize_pixel_assignments(assignments, image=None, save_path='pixel_assign
     plt.close()
     print(f"Pixel assignments visualization saved to {save_path}")
 
-# utils/bic_selector.py
-def select_k_via_bic(pixels, k_candidates, config):
-    """离线评估候选K，返回已拟合的最优GMM实例"""
-    best_bic = float('inf')
-    best_gmm = None  # 🆕 直接保存实例引用
+def rgb_to_lab(rgb):
+    """RGB [B,3,H,W] (0~1) -> CIELAB [B,3,H,W]"""
+    if rgb.max() > 1.0: rgb = rgb / 255.0  # 兼容 0-255 输入
+    
+    # 1. sRGB -> Linear RGB
+    mask = rgb > 0.04045
+    linear = torch.where(mask, ((rgb + 0.055) / 1.055) ** 2.4, rgb / 12.92)
+    
+    # 2. Linear RGB -> XYZ (D65)
+    M = torch.tensor([
+        [0.4124564, 0.3575761, 0.1804375],
+        [0.2126729, 0.7151522, 0.0721750],
+        [0.0193339, 0.1191920, 0.9503041]
+    ], device=rgb.device, dtype=rgb.dtype)
+    
+    B, C, H, W = rgb.shape
+    rgb_flat = rgb.permute(0, 2, 3, 1).reshape(-1, 3)
+    xyz = torch.matmul(rgb_flat, M.T).reshape(B, H, W, 3).permute(0, 3, 1, 2)
+    
+    # 3. XYZ -> CIELAB
+    ref = torch.tensor([0.95047, 1.00000, 1.08883], device=rgb.device, dtype=rgb.dtype)
+    xyz_norm = xyz / ref.view(1, 3, 1, 1)
+    f = torch.where(xyz_norm > 0.008856, xyz_norm ** (1/3), (903.3 * xyz_norm + 16) / 116)
+    
+    L = 116 * f[:, 0:1, :, :] - 16
+    a = 500 * (f[:, 0:1, :, :] - f[:, 1:2, :, :])
+    b = 200 * (f[:, 1:2, :, :] - f[:, 2:3, :, :])
+    return torch.cat([L, a, b], dim=1)
 
-    for k in k_candidates:
-        # 创建候选实例
-        gmm = PixelGaussianMixture(
-            num_components=k,
-            feature_dim=3,  # LAB空间
-            device=config.device,
-            covariance_type='diag',
-            max_iters=config.gmm_init_iters
-        )
-        
-        # 🔹 执行拟合（内部完成 KMeans初始化 + EM迭代，并设置 initialized=True）
-        log_likelihood = gmm.fit(pixels, return_details=False)
-        
-        # 🔹 计算 BIC（仅读取已拟合参数，不修改状态）
-        n_samples = pixels.shape[0]
-        m = (k - 1) + 2 * k * 3  # 对角协方差下的自由参数数
-        bic = m * np.log(n_samples) - 2.0 * log_likelihood
-        
-        if bic < best_bic:
-            best_bic = bic
-            best_gmm = gmm  # 🆕 Python引用传递，零拷贝开销
+def lab_to_rgb(lab):
+    """CIELAB [B,3,H,W] -> RGB [B,3,H,W]，训练时允许越界，不默认 clamp 到 [0,1]"""
+    L, a, b = lab[:, 0:1, :, :], lab[:, 1:2, :, :], lab[:, 2:3, :, :]
+    f_y = (L + 16) / 116
+    f_x = a / 500 + f_y
+    f_z = f_y - b / 200
+    
+    delta = 6/29
+    f_inv = torch.where(f_x > delta, f_x**3, 3*delta**2*(f_x - 4/29))
+    f_inv = torch.cat([f_inv, torch.where(f_y > delta, f_y**3, 3*delta**2*(f_y - 4/29)), 
+                        torch.where(f_z > delta, f_z**3, 3*delta**2*(f_z - 4/29))], dim=1)
+    
+    ref = torch.tensor([0.95047, 1.00000, 1.08883], device=lab.device, dtype=lab.dtype)
+    xyz = f_inv * ref.view(1, 3, 1, 1)
+    
+    M_inv = torch.tensor([
+        [ 3.2404542, -1.5371385, -0.4985314],
+        [-0.9692660,  1.8760108,  0.0415560],
+        [ 0.0556434, -0.2040259,  1.0572252]
+    ], device=lab.device, dtype=lab.dtype)
+    
+    B, C, H, W = lab.shape
+    xyz_flat = xyz.permute(0, 2, 3, 1).reshape(-1, 3)
+    rgb_linear = torch.matmul(xyz_flat, M_inv.T).reshape(B, H, W, 3).permute(0, 3, 1, 2)
+    
+    # 防止负数直接做幂运算造成 NaN
+    rgb_linear_pos = rgb_linear.clamp_min(0.0)
 
-    print(f"[BIC] Optimal K={best_gmm.num_components}, BIC={best_bic:.2f}")
-    return best_gmm
+    # Linear RGB -> sRGB
+    mask = rgb_linear > 0.0031308
+    rgb = torch.where(mask, 1.055 * (rgb_linear ** (1/2.4)) - 0.055, 12.92 * rgb_linear)
+    # 改变正常的lab到rgb转换流程，增加平滑压制，避免 clamp 导致的死板边界问题
+    # return torch.clamp(rgb, 0.0, 1.0)
+
+    # rgb 是计算出来的可能越界的张量
+    # 方案：用平滑曲线替代粗暴 clamp
+    # 将中心点 0.5 保持不变，两端用 Tanh 平滑压制
+    # rgb_shifted = (rgb - 0.5) * 2.0  # 映射到大概 [-1, 1] 及其以外
+    # rgb_squashed = torch.tanh(rgb_shifted) # 平滑压缩到 [-1, 1] 绝对范围内
+    # rgb_final = rgb_squashed * 0.5 + 0.5 # 映射回 [0, 1]
+
+    return rgb
+    
+def soft_gamut_compress(rgb, delta=0.05):
+    y = rgb.clone()
+
+    low = rgb < delta
+    y[low] = delta * torch.exp((rgb[low] - delta) / delta)
+
+    high = rgb > 1.0 - delta
+    y[high] = 1.0 - delta * torch.exp(-(rgb[high] - (1.0 - delta)) / delta)
+
+    return y

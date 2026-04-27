@@ -49,7 +49,29 @@ class PixelStyleTransfer(nn.Module):
 
         # 扩展像素到 [B, H, W, 1, C]，对每个 k 计算候选风格化结果
         source_expand = source_nhwc.unsqueeze(3)
-        candidates = ((source_expand - mu_s) / (sigma_s + self.eps)) * sigma_t + mu_t
+        # # 在 style_transfer.py 中修改 AdaIN 公式
+        # scale_factor = sigma_t / (sigma_s + self.eps)
+        # # 限制方差放大的极限（例如最大只允许放大 2.5 倍或 3.0 倍）
+        # scale_factor = torch.clamp(scale_factor, max=3.0)
+        sigma_s = sigma_s.clamp_min(self.eps)
+        sigma_t = sigma_t.clamp_min(self.eps)
+        raw_scale = sigma_t / sigma_s
+
+        # 推荐起点：L 通道放宽一点，a/b 保守一点
+        # 你现在是 LAB，所以 channels=3，顺序默认 L,a,b
+        scale_cap = torch.tensor(
+            [2.5, 1.8, 1.8],
+            device=raw_scale.device,
+            dtype=raw_scale.dtype
+        ).view(1, 1, 1, 1, channels)
+
+        log_raw = torch.log(raw_scale)
+        log_cap = torch.log(scale_cap)
+
+        # 双边限制：既不让它炸，也不让它过度压平
+        log_scale = torch.clamp(log_raw, min=-log_cap, max=log_cap)
+        scale_factor = torch.exp(log_scale)
+        candidates = ((source_expand - mu_s) * scale_factor) + mu_t
 
         # 软分配融合: x_style = Σ_k γ_nk * x_hat_nk
         gamma = responsibilities.unsqueeze(-1)  # [B, H, W, K, 1]
@@ -60,7 +82,7 @@ class PixelStyleTransfer(nn.Module):
 
         styled_images = styled_nhwc.permute(0, 3, 1, 2)
         
-        # 确保像素值在[0,1]范围内
-        styled_images = torch.clamp(styled_images, 0.0, 1.0)
+        # # 确保像素值在[0,1]范围内
+        # styled_images = torch.clamp(styled_images, 0.0, 1.0)
         
         return styled_images
